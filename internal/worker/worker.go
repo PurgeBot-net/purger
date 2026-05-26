@@ -2,6 +2,7 @@ package worker
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"time"
@@ -95,11 +96,23 @@ func (w *Worker) loop(ctx context.Context, eng *engine.Engine) {
 			zap.String("type", string(j.PurgeType)),
 		)
 
-		if err := eng.Execute(ctx, j); err != nil {
-			w.logger.Error("purge job failed", zap.String("id", j.ID), zap.Error(err))
+		err = eng.Execute(ctx, j)
+		if errors.Is(err, engine.ErrInterrupted) {
+			w.logger.Info("purge job interrupted; leaving active for recovery", zap.String("id", j.ID))
+			return
 		}
 
-		job.DeleteActiveJob(ctx, w.redis, j.GuildID)
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		if err != nil {
+			if errors.Is(err, engine.ErrCancelled) {
+				w.logger.Info("purge job cancelled", zap.String("id", j.ID))
+			} else {
+				w.logger.Error("purge job failed", zap.String("id", j.ID), zap.Error(err))
+			}
+		}
+		job.DeleteProgress(cleanupCtx, w.redis, j.ID)
+		job.DeleteActiveJob(cleanupCtx, w.redis, j.GuildID)
+		cancel()
 	}
 }
 
@@ -111,6 +124,9 @@ func (w *Worker) recoverActiveJobs(ctx context.Context) {
 		return
 	}
 	for _, j := range jobs {
+		if err := job.RemoveQueued(ctx, w.redis, j); err != nil {
+			w.logger.Warn("remove stale queued recovered job", zap.String("id", j.ID), zap.Uint64("guild_id", j.GuildID), zap.Error(err))
+		}
 		if err := job.Enqueue(ctx, w.redis, j); err != nil {
 			w.logger.Error("re-enqueue recovered job", zap.String("id", j.ID), zap.Uint64("guild_id", j.GuildID), zap.Error(err))
 		} else {

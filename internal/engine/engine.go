@@ -2,6 +2,7 @@ package engine
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"regexp"
 	"strings"
@@ -9,6 +10,7 @@ import (
 
 	"github.com/disgoorg/disgo/bot"
 	"github.com/disgoorg/disgo/discord"
+	"github.com/disgoorg/disgo/rest"
 	"github.com/disgoorg/snowflake/v2"
 	"github.com/redis/go-redis/v9"
 	"go.uber.org/zap"
@@ -22,6 +24,11 @@ import (
 const (
 	bulkDeleteMaxAge = 14 * 24 * time.Hour
 	fetchBatchSize   = 100
+)
+
+var (
+	ErrInterrupted = errors.New("purge interrupted")
+	ErrCancelled   = errors.New("purge cancelled")
 )
 
 type Engine struct {
@@ -92,10 +99,180 @@ type channelResult struct {
 	err     error
 }
 
+func ensureChannelProgress(p *job.PurgeProgress) {
+	if p.CurrentIndex < 0 {
+		p.CurrentIndex = 0
+	}
+	if len(p.Channels) < len(p.ChannelIDs) {
+		existing := len(p.Channels)
+		for i := existing; i < len(p.ChannelIDs); i++ {
+			p.Channels = append(p.Channels, job.PurgeChannelProgress{ChannelID: p.ChannelIDs[i]})
+		}
+	}
+	if len(p.Channels) > len(p.ChannelIDs) {
+		p.Channels = p.Channels[:len(p.ChannelIDs)]
+	}
+	for i, id := range p.ChannelIDs {
+		if p.Channels[i].ChannelID == 0 {
+			p.Channels[i].ChannelID = id
+		}
+	}
+	if p.CurrentIndex > len(p.ChannelIDs) {
+		p.CurrentIndex = len(p.ChannelIDs)
+	}
+}
+
+func currentChannelProgress(p *job.PurgeProgress) *job.PurgeChannelProgress {
+	ensureChannelProgress(p)
+	if p.CurrentIndex >= len(p.Channels) {
+		return nil
+	}
+	return &p.Channels[p.CurrentIndex]
+}
+
+func channelResultsFromProgress(p *job.PurgeProgress) []channelResult {
+	results := make([]channelResult, 0, len(p.Channels))
+	for _, ch := range p.Channels {
+		if !ch.Done && ch.Deleted == 0 && ch.Error == "" {
+			continue
+		}
+		result := channelResult{name: fmt.Sprintf("<#%d>", ch.ChannelID), deleted: ch.Deleted}
+		if ch.Error != "" {
+			result.err = errors.New(ch.Error)
+		}
+		results = append(results, result)
+	}
+	return results
+}
+
+func (e *Engine) saveProgress(ctx context.Context, p *job.PurgeProgress) {
+	saveCtx := ctx
+	var cancel context.CancelFunc
+	if ctx.Err() != nil {
+		saveCtx, cancel = context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+	}
+	if err := job.SaveProgress(saveCtx, e.redis, p); err != nil {
+		e.logger.Warn("save purge progress", zap.String("id", p.JobID), zap.Error(err))
+	}
+}
+
+func (e *Engine) isCancelled(jobID string) bool {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	cancelled, err := job.IsCancelled(ctx, e.redis, jobID)
+	if err != nil {
+		e.logger.Warn("check purge cancellation", zap.String("id", jobID), zap.Error(err))
+	}
+	return cancelled
+}
+
+func addDeleted(p *job.PurgeProgress, n int) {
+	if n <= 0 {
+		return
+	}
+	ch := currentChannelProgress(p)
+	if ch == nil {
+		return
+	}
+	ch.Deleted += n
+	p.TotalDeleted += n
+}
+
+func setPendingDeletes(p *job.PurgeProgress, channelID uint64, ids []snowflake.ID) {
+	p.PendingChannelID = channelID
+	p.PendingDeleteIDs = make([]uint64, len(ids))
+	for i, id := range ids {
+		p.PendingDeleteIDs[i] = uint64(id)
+	}
+}
+
+func clearPendingDeletes(p *job.PurgeProgress) {
+	p.PendingChannelID = 0
+	p.PendingDeleteIDs = nil
+}
+
+func (e *Engine) settlePendingDeletes(ctx context.Context, j *job.PurgeJob, progress *job.PurgeProgress) error {
+	if len(progress.PendingDeleteIDs) == 0 {
+		return nil
+	}
+
+	channelID := progress.PendingChannelID
+	if channelID == 0 {
+		if progress.CurrentIndex >= len(progress.ChannelIDs) {
+			clearPendingDeletes(progress)
+			e.saveProgress(ctx, progress)
+			return nil
+		}
+		channelID = progress.ChannelIDs[progress.CurrentIndex]
+	}
+	cid := snowflake.ID(channelID)
+
+	var retry []snowflake.ID
+	var reconciled int
+	for _, rawID := range progress.PendingDeleteIDs {
+		if e.isCancelled(j.ID) {
+			return ErrCancelled
+		}
+		if ctx.Err() != nil {
+			e.saveProgress(ctx, progress)
+			return ErrInterrupted
+		}
+
+		id := snowflake.ID(rawID)
+		if _, err := e.client.Rest.GetMessage(cid, id); err == nil {
+			retry = append(retry, id)
+		} else if rest.IsJSONErrorCode(err, rest.JSONErrorCodeUnknownMessage) {
+			reconciled++
+		} else {
+			e.logger.Warn("check pending deleted message", zap.Uint64("channel", channelID), zap.Uint64("message", rawID), zap.Error(err))
+			retry = append(retry, id)
+		}
+	}
+
+	addDeleted(progress, reconciled)
+	setPendingDeletes(progress, channelID, retry)
+	e.saveProgress(ctx, progress)
+
+	for _, id := range retry {
+		if e.isCancelled(j.ID) {
+			return ErrCancelled
+		}
+		if ctx.Err() != nil {
+			e.saveProgress(ctx, progress)
+			return ErrInterrupted
+		}
+
+		if err := e.client.Rest.DeleteMessage(cid, id); err == nil || rest.IsJSONErrorCode(err, rest.JSONErrorCodeUnknownMessage) {
+			addDeleted(progress, 1)
+			e.saveProgress(ctx, progress)
+		}
+	}
+
+	clearPendingDeletes(progress)
+	e.saveProgress(ctx, progress)
+	return nil
+}
+
 // Execute runs a purge job end-to-end.
 func (e *Engine) Execute(ctx context.Context, j *job.PurgeJob) error {
 	start := time.Now()
 	target := e.targetDisplay(j)
+
+	if ctx.Err() != nil {
+		return ErrInterrupted
+	}
+
+	progressCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	progress, err := job.GetProgress(progressCtx, e.redis, j.ID)
+	cancel()
+	if err != nil {
+		return fmt.Errorf("get purge progress: %w", err)
+	}
+	if ctx.Err() != nil {
+		return ErrInterrupted
+	}
 
 	showBranding := true
 	if c, err := e.db.GetCustomization(ctx, int64(j.GuildID)); err == nil && c != nil {
@@ -105,24 +282,31 @@ func (e *Engine) Execute(ctx context.Context, j *job.PurgeJob) error {
 	// Set up the response channel before anything else so errors can always be delivered.
 	var commandMsgID, fallbackChanID, fallbackMsgID snowflake.ID
 	fallbackJustCreated := false
-	if msg, err := e.client.Rest.GetInteractionResponse(snowflake.ID(j.ApplicationID), j.InteractionToken); err == nil {
-		commandMsgID = msg.ID
-	} else if j.InteractionChannelID != 0 {
-		e.logger.Warn("interaction token expired, falling back to channel message", zap.Error(err))
-		cid := snowflake.ID(j.InteractionChannelID)
-		startContainer := discord.NewContainer(
-			discord.NewTextDisplay(locale.MsgPurgeInProgress.In(j.Locale, target)),
-			discord.NewTextDisplay(locale.MsgPurgeStatusLabel.In(j.Locale, locale.MsgPurgeStatusStarting.In(j.Locale))),
-		)
-		if msg, err := e.client.Rest.CreateMessage(cid, discord.MessageCreate{
-			Flags:      discord.MessageFlagIsComponentsV2,
-			Components: []discord.LayoutComponent{startContainer, cancelButton(j)},
-		}); err == nil {
-			fallbackChanID = cid
-			fallbackMsgID = msg.ID
-			fallbackJustCreated = true
-		} else {
-			e.logger.Warn("create fallback status message", zap.Error(err))
+	if progress != nil {
+		commandMsgID = snowflake.ID(progress.CommandMessageID)
+		fallbackChanID = snowflake.ID(progress.FallbackChannelID)
+		fallbackMsgID = snowflake.ID(progress.FallbackMessageID)
+	}
+	if fallbackMsgID == 0 {
+		if msg, err := e.client.Rest.GetInteractionResponse(snowflake.ID(j.ApplicationID), j.InteractionToken); err == nil {
+			commandMsgID = msg.ID
+		} else if j.InteractionChannelID != 0 {
+			e.logger.Warn("interaction token expired, falling back to channel message", zap.Error(err))
+			cid := snowflake.ID(j.InteractionChannelID)
+			startContainer := discord.NewContainer(
+				discord.NewTextDisplay(locale.MsgPurgeInProgress.In(j.Locale, target)),
+				discord.NewTextDisplay(locale.MsgPurgeStatusLabel.In(j.Locale, locale.MsgPurgeStatusStarting.In(j.Locale))),
+			)
+			if msg, err := e.client.Rest.CreateMessage(cid, discord.MessageCreate{
+				Flags:      discord.MessageFlagIsComponentsV2,
+				Components: []discord.LayoutComponent{startContainer, cancelButton(j)},
+			}); err == nil {
+				fallbackChanID = cid
+				fallbackMsgID = msg.ID
+				fallbackJustCreated = true
+			} else {
+				e.logger.Warn("create fallback status message", zap.Error(err))
+			}
 		}
 	}
 
@@ -136,49 +320,109 @@ func (e *Engine) Execute(ctx context.Context, j *job.PurgeJob) error {
 	state.fallbackChannelID = fallbackChanID
 	state.fallbackMessageID = fallbackMsgID
 
+	if progress == nil {
+		channels, err := e.resolveChannels(ctx, j)
+		if err != nil {
+			e.updateText(ctx, j, state, locale.MsgPurgeResolveError.In(j.Locale, err.Error()))
+			return err
+		}
+		cutoff := time.Time{}
+		if j.Days > 0 {
+			cutoff = start.Add(-time.Duration(j.Days) * 24 * time.Hour)
+		}
+		progress = &job.PurgeProgress{
+			JobID:             j.ID,
+			GuildID:           j.GuildID,
+			StartedAt:         start,
+			CutoffAt:          cutoff,
+			ChannelIDs:        channels,
+			CommandMessageID:  uint64(commandMsgID),
+			FallbackChannelID: uint64(fallbackChanID),
+			FallbackMessageID: uint64(fallbackMsgID),
+		}
+		ensureChannelProgress(progress)
+		e.saveProgress(ctx, progress)
+	} else {
+		if progress.StartedAt.IsZero() {
+			progress.StartedAt = start
+		}
+		if progress.CutoffAt.IsZero() && j.Days > 0 {
+			progress.CutoffAt = progress.StartedAt.Add(-time.Duration(j.Days) * 24 * time.Hour)
+		}
+		if commandMsgID != 0 {
+			progress.CommandMessageID = uint64(commandMsgID)
+		}
+		if fallbackChanID != 0 {
+			progress.FallbackChannelID = uint64(fallbackChanID)
+		}
+		if fallbackMsgID != 0 {
+			progress.FallbackMessageID = uint64(fallbackMsgID)
+		}
+		ensureChannelProgress(progress)
+		e.saveProgress(ctx, progress)
+	}
+
 	if !fallbackJustCreated {
 		e.sendInProgress(ctx, j, state, target, locale.MsgPurgeStatusStarting.In(j.Locale), true)
 	}
 
-	channels, err := e.resolveChannels(ctx, j)
-	if err != nil {
-		e.updateText(ctx, j, state, locale.MsgPurgeResolveError.In(j.Locale, err.Error()))
-		return err
-	}
-
-	var results []channelResult
-	var totalDeleted int
-
-	for _, channelID := range channels {
-		if cancelled, _ := job.IsCancelled(ctx, e.redis, j.ID); cancelled {
-			e.sendCancelled(ctx, j, state, totalDeleted, showBranding)
-			return nil
+	for progress.CurrentIndex < len(progress.ChannelIDs) {
+		if e.isCancelled(j.ID) {
+			e.sendCancelled(ctx, j, state, progress.TotalDeleted, showBranding)
+			return ErrCancelled
+		}
+		if ctx.Err() != nil {
+			e.saveProgress(ctx, progress)
+			return ErrInterrupted
 		}
 
+		channelID := progress.ChannelIDs[progress.CurrentIndex]
 		chanName := fmt.Sprintf("<#%d>", channelID)
 		e.sendInProgress(ctx, j, state, target, locale.MsgPurgeStatusFetching.In(j.Locale, chanName), true)
+		e.saveProgress(ctx, progress)
 
-		deleted, err := e.purgeChannel(ctx, j, channelID, state)
-		results = append(results, channelResult{name: chanName, deleted: deleted, err: err})
+		err := e.purgeChannel(ctx, j, channelID, state, progress)
+		if errors.Is(err, ErrCancelled) {
+			e.sendCancelled(ctx, j, state, progress.TotalDeleted, showBranding)
+			return ErrCancelled
+		}
+		if errors.Is(err, ErrInterrupted) {
+			e.saveProgress(ctx, progress)
+			return ErrInterrupted
+		}
+
+		ch := currentChannelProgress(progress)
+		if ch != nil {
+			ch.Done = true
+			if err != nil {
+				ch.Error = err.Error()
+			}
+		}
 		if err != nil {
 			e.logger.Warn("channel purge failed", zap.Uint64("channel", channelID), zap.Error(err))
 		}
-		totalDeleted += deleted
+		progress.BeforeID = 0
+		progress.CurrentIndex++
+		e.saveProgress(ctx, progress)
 	}
 
-	if cancelled, _ := job.IsCancelled(ctx, e.redis, j.ID); cancelled {
-		e.sendCancelled(ctx, j, state, totalDeleted, showBranding)
-		return nil
+	if e.isCancelled(j.ID) {
+		e.sendCancelled(ctx, j, state, progress.TotalDeleted, showBranding)
+		return ErrCancelled
+	}
+	if ctx.Err() != nil {
+		e.saveProgress(ctx, progress)
+		return ErrInterrupted
 	}
 
-	elapsed := time.Since(start)
-	e.sendCompletion(ctx, j, state, target, totalDeleted, elapsed, results, showBranding)
+	elapsed := time.Since(progress.StartedAt)
+	e.sendCompletion(ctx, j, state, target, progress.TotalDeleted, elapsed, channelResultsFromProgress(progress), showBranding)
 
 	if err := e.db.RecordPurgeEvent(ctx, database.RecordPurgeEventParams{
 		GuildID:    int64(j.GuildID),
 		PurgeType:  string(j.PurgeType),
 		TargetType: string(j.TargetType),
-		Deleted:    totalDeleted,
+		Deleted:    progress.TotalDeleted,
 		DurationMs: int(elapsed.Milliseconds()),
 	}); err != nil {
 		e.logger.Warn("record purge event", zap.Error(err))
@@ -306,26 +550,25 @@ func (e *Engine) fetchThreadsForChannels(ctx context.Context, guildID uint64, pa
 }
 
 // purgeChannel fetches and deletes matching messages from a single channel or thread.
-func (e *Engine) purgeChannel(ctx context.Context, j *job.PurgeJob, channelID uint64, state *execState) (int, error) {
-	var (
-		deleted  int
-		beforeID snowflake.ID
-		cutoff   time.Time
-	)
-	if j.Days > 0 {
-		cutoff = time.Now().Add(-time.Duration(j.Days) * 24 * time.Hour)
-	}
-
+func (e *Engine) purgeChannel(ctx context.Context, j *job.PurgeJob, channelID uint64, state *execState, progress *job.PurgeProgress) error {
 	cid := snowflake.ID(channelID)
 
 	for {
-		if cancelled, _ := job.IsCancelled(ctx, e.redis, j.ID); cancelled {
-			break
+		if err := e.settlePendingDeletes(ctx, j, progress); err != nil {
+			return err
+		}
+		if e.isCancelled(j.ID) {
+			return ErrCancelled
+		}
+		if ctx.Err() != nil {
+			e.saveProgress(ctx, progress)
+			return ErrInterrupted
 		}
 
+		beforeID := snowflake.ID(progress.BeforeID)
 		messages, err := e.client.Rest.GetMessages(cid, 0, beforeID, 0, fetchBatchSize)
 		if err != nil {
-			return deleted, fmt.Errorf("fetch messages: %w", err)
+			return fmt.Errorf("fetch messages: %w", err)
 		}
 		if len(messages) == 0 {
 			break
@@ -336,11 +579,14 @@ func (e *Engine) purgeChannel(ctx context.Context, j *job.PurgeJob, channelID ui
 		var atCutoff bool
 
 		for _, msg := range messages {
-			if !cutoff.IsZero() && msg.CreatedAt.Before(cutoff) {
+			if !progress.CutoffAt.IsZero() && msg.CreatedAt.Before(progress.CutoffAt) {
 				atCutoff = true
 				break
 			}
 			if state.commandMessageID != 0 && msg.ID == state.commandMessageID {
+				continue
+			}
+			if state.fallbackMessageID != 0 && msg.ID == state.fallbackMessageID {
 				continue
 			}
 			if !e.matchesJob(ctx, j, msg, state) {
@@ -353,38 +599,67 @@ func (e *Engine) purgeChannel(ctx context.Context, j *job.PurgeJob, channelID ui
 			}
 		}
 
+		nextBeforeID := progress.BeforeID
 		if len(messages) > 0 {
-			beforeID = messages[len(messages)-1].ID
+			nextBeforeID = uint64(messages[len(messages)-1].ID)
 		}
 
 		for len(toDelete) > 0 {
+			if e.isCancelled(j.ID) {
+				return ErrCancelled
+			}
+			if ctx.Err() != nil {
+				e.saveProgress(ctx, progress)
+				return ErrInterrupted
+			}
+
 			batch := toDelete
 			if len(batch) > 100 {
 				batch = toDelete[:100]
 			}
 			toDelete = toDelete[len(batch):]
+			setPendingDeletes(progress, channelID, batch)
+			e.saveProgress(ctx, progress)
+			deleted := 0
 			if len(batch) == 1 {
 				if e.client.Rest.DeleteMessage(cid, batch[0]) == nil {
-					deleted++
+					deleted = 1
 				}
 			} else {
 				if err := e.client.Rest.BulkDeleteMessages(cid, batch); err == nil {
-					deleted += len(batch)
+					deleted = len(batch)
 				}
 			}
+			addDeleted(progress, deleted)
+			clearPendingDeletes(progress)
+			e.saveProgress(ctx, progress)
 		}
 		for _, id := range oldMessages {
-			if e.client.Rest.DeleteMessage(cid, id) == nil {
-				deleted++
+			if e.isCancelled(j.ID) {
+				return ErrCancelled
 			}
+			if ctx.Err() != nil {
+				e.saveProgress(ctx, progress)
+				return ErrInterrupted
+			}
+			setPendingDeletes(progress, channelID, []snowflake.ID{id})
+			e.saveProgress(ctx, progress)
+			if e.client.Rest.DeleteMessage(cid, id) == nil {
+				addDeleted(progress, 1)
+			}
+			clearPendingDeletes(progress)
+			e.saveProgress(ctx, progress)
 		}
+
+		progress.BeforeID = nextBeforeID
+		e.saveProgress(ctx, progress)
 
 		if atCutoff || len(messages) < fetchBatchSize {
 			break
 		}
 	}
 
-	return deleted, nil
+	return nil
 }
 
 // matchesJob returns true if the message should be deleted.
