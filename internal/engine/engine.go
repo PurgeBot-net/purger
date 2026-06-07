@@ -58,6 +58,7 @@ type execState struct {
 	// are sent by editing a regular channel message instead.
 	fallbackChannelID snowflake.ID
 	fallbackMessageID snowflake.ID
+	progress          *job.PurgeProgress
 }
 
 func newExecState(j *job.PurgeJob) (*execState, error) {
@@ -154,6 +155,108 @@ func (e *Engine) saveProgress(ctx context.Context, p *job.PurgeProgress) {
 	}
 	if err := job.SaveProgress(saveCtx, e.redis, p); err != nil {
 		e.logger.Warn("save purge progress", zap.String("id", p.JobID), zap.Error(err))
+	}
+}
+
+func statusTargetFromInteractionResponse(msg *discord.Message) (snowflake.ID, snowflake.ID, bool) {
+	if msg == nil || msg.ID == 0 || msg.ChannelID == 0 || msg.Flags.Has(discord.MessageFlagEphemeral) {
+		return 0, 0, false
+	}
+	return msg.ChannelID, msg.ID, true
+}
+
+func interactionResponseStillLoading(msg *discord.Message) bool {
+	return msg != nil && msg.Flags.Has(discord.MessageFlagLoading)
+}
+
+func shouldCreateStatusMessageAfterInteractionError(err error) bool {
+	return rest.IsJSONErrorCode(err, rest.JSONErrorCodeInvalidWebhookToken, rest.JSONErrorCodeUnknownWebhook)
+}
+
+func shouldReplaceStatusMessageAfterUpdateError(err error) bool {
+	return rest.IsJSONErrorCode(err, rest.JSONErrorCodeUnknownMessage)
+}
+
+func (e *Engine) createStatusMessage(ctx context.Context, j *job.PurgeJob, components ...discord.LayoutComponent) (snowflake.ID, snowflake.ID, bool) {
+	if j.InteractionChannelID == 0 {
+		return 0, 0, false
+	}
+	msg, err := e.client.Rest.CreateMessage(
+		snowflake.ID(j.InteractionChannelID),
+		discord.NewMessageCreateV2(components...),
+	)
+	if err != nil {
+		e.logger.Warn("create channel status message", zap.Error(err))
+		return 0, 0, false
+	}
+	channelID := msg.ChannelID
+	if channelID == 0 {
+		channelID = snowflake.ID(j.InteractionChannelID)
+	}
+	return channelID, msg.ID, true
+}
+
+func (e *Engine) adoptInteractionResponseTarget(ctx context.Context, j *job.PurgeJob, state *execState) {
+	msg, err := e.client.Rest.GetInteractionResponse(snowflake.ID(j.ApplicationID), j.InteractionToken)
+	if err != nil {
+		e.logger.Warn("fetch interaction response for status target", zap.Error(err))
+		return
+	}
+	if msg.ID != 0 {
+		state.commandMessageID = msg.ID
+	}
+	if channelID, messageID, ok := statusTargetFromInteractionResponse(msg); ok {
+		e.setStatusTarget(ctx, state, channelID, messageID)
+	}
+}
+
+func (e *Engine) dismissStaleInteractionMessage(j *job.PurgeJob, state *execState, newMessageID snowflake.ID) {
+	if state.commandMessageID == 0 || state.commandMessageID == newMessageID {
+		return
+	}
+	channelID := state.fallbackChannelID
+	if channelID == 0 && j.InteractionChannelID != 0 {
+		channelID = snowflake.ID(j.InteractionChannelID)
+	}
+	if channelID == 0 {
+		return
+	}
+	if err := e.client.Rest.DeleteMessage(channelID, state.commandMessageID); err != nil {
+		e.logger.Warn("delete stale interaction status message", zap.Error(err))
+	}
+}
+
+func (e *Engine) setStatusTarget(ctx context.Context, state *execState, channelID, messageID snowflake.ID) {
+	state.fallbackChannelID = channelID
+	state.fallbackMessageID = messageID
+	e.persistMessageTargets(ctx, state)
+}
+
+func (e *Engine) clearStatusTarget(ctx context.Context, state *execState) {
+	state.fallbackChannelID = 0
+	state.fallbackMessageID = 0
+	e.persistMessageTargets(ctx, state)
+}
+
+func (e *Engine) persistMessageTargets(ctx context.Context, state *execState) {
+	if state.progress == nil {
+		return
+	}
+	changed := false
+	if state.commandMessageID != 0 && state.progress.CommandMessageID != uint64(state.commandMessageID) {
+		state.progress.CommandMessageID = uint64(state.commandMessageID)
+		changed = true
+	}
+	if state.progress.FallbackChannelID != uint64(state.fallbackChannelID) {
+		state.progress.FallbackChannelID = uint64(state.fallbackChannelID)
+		changed = true
+	}
+	if state.progress.FallbackMessageID != uint64(state.fallbackMessageID) {
+		state.progress.FallbackMessageID = uint64(state.fallbackMessageID)
+		changed = true
+	}
+	if changed {
+		e.saveProgress(ctx, state.progress)
 	}
 }
 
@@ -281,7 +384,7 @@ func (e *Engine) Execute(ctx context.Context, j *job.PurgeJob) error {
 
 	// Set up the response channel before anything else so errors can always be delivered.
 	var commandMsgID, fallbackChanID, fallbackMsgID snowflake.ID
-	fallbackJustCreated := false
+	statusJustCreated := false
 	if progress != nil {
 		commandMsgID = snowflake.ID(progress.CommandMessageID)
 		fallbackChanID = snowflake.ID(progress.FallbackChannelID)
@@ -290,23 +393,38 @@ func (e *Engine) Execute(ctx context.Context, j *job.PurgeJob) error {
 	if fallbackMsgID == 0 {
 		if msg, err := e.client.Rest.GetInteractionResponse(snowflake.ID(j.ApplicationID), j.InteractionToken); err == nil {
 			commandMsgID = msg.ID
+			if _, _, ok := statusTargetFromInteractionResponse(msg); !ok {
+				startContainer := discord.NewContainer(
+					discord.NewTextDisplay(locale.MsgPurgeInProgress.In(j.Locale, target)),
+					discord.NewTextDisplay(locale.MsgPurgeStatusLabel.In(j.Locale, locale.MsgPurgeStatusStarting.In(j.Locale))),
+				)
+				if channelID, messageID, ok := e.createStatusMessage(ctx, j, startContainer, cancelButton(j)); ok {
+					e.dismissStaleInteractionMessage(j, &execState{commandMessageID: commandMsgID}, messageID)
+					fallbackChanID = channelID
+					fallbackMsgID = messageID
+					statusJustCreated = true
+				}
+			}
 		} else if j.InteractionChannelID != 0 {
-			e.logger.Warn("interaction token expired, falling back to channel message", zap.Error(err))
-			cid := snowflake.ID(j.InteractionChannelID)
+			e.logger.Info("interaction response unavailable, creating channel status message", zap.Error(err))
 			startContainer := discord.NewContainer(
 				discord.NewTextDisplay(locale.MsgPurgeInProgress.In(j.Locale, target)),
 				discord.NewTextDisplay(locale.MsgPurgeStatusLabel.In(j.Locale, locale.MsgPurgeStatusStarting.In(j.Locale))),
 			)
-			if msg, err := e.client.Rest.CreateMessage(cid, discord.MessageCreate{
-				Flags:      discord.MessageFlagIsComponentsV2,
-				Components: []discord.LayoutComponent{startContainer, cancelButton(j)},
-			}); err == nil {
-				fallbackChanID = cid
-				fallbackMsgID = msg.ID
-				fallbackJustCreated = true
-			} else {
-				e.logger.Warn("create fallback status message", zap.Error(err))
+			if channelID, messageID, ok := e.createStatusMessage(ctx, j, startContainer, cancelButton(j)); ok {
+				fallbackChanID = channelID
+				fallbackMsgID = messageID
+				statusJustCreated = true
 			}
+		}
+	} else if fallbackChanID != 0 && fallbackMsgID != 0 {
+		if msg, err := e.client.Rest.GetMessage(fallbackChanID, fallbackMsgID); err == nil && interactionResponseStillLoading(msg) {
+			e.logger.Info("restored status message still loading, re-acknowledging via interaction webhook")
+			commandMsgID = snowflake.ID(progress.CommandMessageID)
+			fallbackChanID = 0
+			fallbackMsgID = 0
+			progress.FallbackChannelID = 0
+			progress.FallbackMessageID = 0
 		}
 	}
 
@@ -361,8 +479,9 @@ func (e *Engine) Execute(ctx context.Context, j *job.PurgeJob) error {
 		ensureChannelProgress(progress)
 		e.saveProgress(ctx, progress)
 	}
+	state.progress = progress
 
-	if !fallbackJustCreated {
+	if !statusJustCreated {
 		e.sendInProgress(ctx, j, state, target, locale.MsgPurgeStatusStarting.In(j.Locale), true)
 	}
 
@@ -842,23 +961,44 @@ func (e *Engine) updateText(ctx context.Context, j *job.PurgeJob, state *execSta
 }
 
 func (e *Engine) updateComponents(ctx context.Context, j *job.PurgeJob, state *execState, components ...discord.LayoutComponent) {
-	if state.fallbackMessageID != 0 {
+	if state.fallbackChannelID != 0 && state.fallbackMessageID != 0 {
 		_, err := e.client.Rest.UpdateMessage(
 			state.fallbackChannelID,
 			state.fallbackMessageID,
 			discord.NewMessageUpdateV2(components...),
 		)
 		if err != nil {
-			e.logger.Warn("update fallback message", zap.Error(err))
+			if shouldReplaceStatusMessageAfterUpdateError(err) {
+				e.logger.Info("status message disappeared, creating replacement", zap.Error(err))
+				e.clearStatusTarget(ctx, state)
+				if channelID, messageID, ok := e.createStatusMessage(ctx, j, components...); ok {
+					e.setStatusTarget(ctx, state, channelID, messageID)
+					return
+				}
+			}
+			e.logger.Warn("update status message", zap.Error(err))
 		}
 		return
 	}
+
+	// The first edit after a deferred response must go through the interaction
+	// webhook so Discord clears the "Bot is thinking..." loading state.
 	_, err := e.client.Rest.UpdateInteractionResponse(
 		snowflake.ID(j.ApplicationID),
 		j.InteractionToken,
 		discord.NewMessageUpdateV2(components...),
 	)
 	if err != nil {
+		if shouldCreateStatusMessageAfterInteractionError(err) {
+			e.logger.Info("interaction token expired, switching to channel status message", zap.Error(err))
+			if channelID, messageID, ok := e.createStatusMessage(ctx, j, components...); ok {
+				e.dismissStaleInteractionMessage(j, state, messageID)
+				e.setStatusTarget(ctx, state, channelID, messageID)
+				return
+			}
+		}
 		e.logger.Warn("update interaction", zap.Error(err))
+		return
 	}
+	e.adoptInteractionResponseTarget(ctx, j, state)
 }

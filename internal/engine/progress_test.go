@@ -4,6 +4,8 @@ import (
 	"testing"
 
 	"github.com/PurgeBot-net/common/job"
+	"github.com/disgoorg/disgo/discord"
+	"github.com/disgoorg/disgo/rest"
 	"github.com/disgoorg/snowflake/v2"
 )
 
@@ -71,5 +73,52 @@ func TestPendingDeletesHelpers(t *testing.T) {
 	clearPendingDeletes(progress)
 	if progress.PendingChannelID != 0 || progress.PendingDeleteIDs != nil {
 		t.Fatalf("pending deletes were not cleared: %#v", progress)
+	}
+}
+
+func TestStatusTargetFromInteractionResponse(t *testing.T) {
+	channelID, messageID, ok := statusTargetFromInteractionResponse(&discord.Message{
+		ID:        200,
+		ChannelID: 100,
+		Flags:     discord.MessageFlagsNone,
+	})
+	if !ok || channelID != 100 || messageID != 200 {
+		t.Fatalf("public response was not durable: channel=%d message=%d ok=%t", channelID, messageID, ok)
+	}
+
+	_, _, ok = statusTargetFromInteractionResponse(&discord.Message{
+		ID:        201,
+		ChannelID: 100,
+		Flags:     discord.MessageFlagEphemeral,
+	})
+	if ok {
+		t.Fatal("ephemeral response should not be treated as a durable status target")
+	}
+}
+
+func TestInteractionResponseStillLoading(t *testing.T) {
+	if !interactionResponseStillLoading(&discord.Message{Flags: discord.MessageFlagLoading}) {
+		t.Fatal("deferred interaction response should still be loading")
+	}
+	if interactionResponseStillLoading(&discord.Message{Flags: discord.MessageFlagsNone}) {
+		t.Fatal("regular message should not be treated as loading")
+	}
+}
+
+func TestStatusFallbackErrorPredicates(t *testing.T) {
+	if !shouldCreateStatusMessageAfterInteractionError(&rest.Error{Code: rest.JSONErrorCodeInvalidWebhookToken}) {
+		t.Fatal("invalid webhook token should create a channel status message")
+	}
+	if !shouldCreateStatusMessageAfterInteractionError(&rest.Error{Code: rest.JSONErrorCodeUnknownWebhook}) {
+		t.Fatal("unknown webhook should create a channel status message")
+	}
+	if shouldCreateStatusMessageAfterInteractionError(&rest.Error{Code: rest.JSONErrorCodeUnknownMessage}) {
+		t.Fatal("unknown message is not an interaction-token failure")
+	}
+	if !shouldReplaceStatusMessageAfterUpdateError(&rest.Error{Code: rest.JSONErrorCodeUnknownMessage}) {
+		t.Fatal("unknown status message should be replaced")
+	}
+	if shouldReplaceStatusMessageAfterUpdateError(&rest.Error{Code: rest.JSONErrorCodeInvalidWebhookToken}) {
+		t.Fatal("invalid webhook token is not a channel-message update failure")
 	}
 }
