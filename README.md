@@ -15,12 +15,13 @@ Purge worker service for PurgeBot. Consumes jobs from the Redis queue and perfor
 
 All configuration is loaded from environment variables (see `.env.example` in the docker repo).
 
-| Variable                                   | Description                       |
-| ------------------------------------------ | --------------------------------- |
-| `DISCORD_TOKEN`                            | Bot token                         |
-| `DISCORD_APPLICATION_ID`                   | Application ID                    |
-| `DATABASE_*`                               | PostgreSQL connection             |
-| `REDIS_ADDR`, `REDIS_PASSWORD`, `REDIS_DB` | Redis connection                  |
-| `SENTRY_DSN`                               | Sentry error reporting (optional) |
-| `LOG_LEVEL`                                | `debug`, `info`, `warn`, `error`  |
-| `LOG_JSON`                                 | `true` for JSON log output        |
+| Variable                                   | Description                                    |
+| ------------------------------------------ | ---------------------------------------------- |
+| `DISCORD_TOKEN`                            | Bot token                                      |
+| `DISCORD_APPLICATION_ID`                   | Application ID                                 |
+| `DATABASE_*`                               | PostgreSQL connection                          |
+| `REDIS_ADDR`, `REDIS_PASSWORD`, `REDIS_DB` | Redis connection                               |
+| `WORKER_CONCURRENCY`                       | Purge workers to run in parallel (default `4`) |
+| `SENTRY_DSN`                               | Sentry error reporting (optional)              |
+| `LOG_LEVEL`                                | `debug`, `info`, `warn`, `error`               |
+| `LOG_JSON`                                 | `true` for JSON log output                     |
