@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"regexp"
+	"slices"
 	"strings"
 	"time"
 
@@ -709,6 +710,9 @@ func (e *Engine) purgeChannel(ctx context.Context, j *job.PurgeJob, channelID ui
 				continue
 			}
 			if j.SkipUserID != 0 && msg.Author.ID == snowflake.ID(j.SkipUserID) {
+				continue
+			}
+			if slices.Contains(j.SkipMessageIDs, uint64(msg.ID)) {
 				continue
 			}
 			if !e.matchesJob(ctx, j, msg, state) {

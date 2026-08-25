@@ -1,5 +1,5 @@
-github.com/PurgeBot-net/common v0.0.0-20260822211027-cc1245165f25 h1:v3FeOSeMvaaLxkP9PQgGDKrKdBON1vkNBrnswDiCWLc=
-github.com/PurgeBot-net/common v0.0.0-20260822211027-cc1245165f25/go.mod h1:olooe/GHQJX/woVbY36JEYv1OV/epp8H0dwWZ0EdpvA=
+github.com/PurgeBot-net/common v0.0.0-20260825182353-beb788fab192 h1:uhLSAFdX8UXgq7E2s6gxF4YOGk9USWkMdAi5HItAkz0=
+github.com/PurgeBot-net/common v0.0.0-20260825182353-beb788fab192/go.mod h1:olooe/GHQJX/woVbY36JEYv1OV/epp8H0dwWZ0EdpvA=
 github.com/PurgeBot-net/database v0.0.0-20260822211030-5f1758be9f51 h1:/ulqxYqpFUbWd4Qw0hkg636ckZoZztZ70pvpUh+NUcA=
 github.com/PurgeBot-net/database v0.0.0-20260822211030-5f1758be9f51/go.mod h1:Do5LvJWqwQ9XNUY4s1cj11JFSNn9ff/jLv6/Ied9FK8=
 github.com/PurgeBot-net/locale v0.0.0-20260822210926-deda2225a492 h1:T1wWkmhLkKjJaO3/inh9VSefhL3aol3CyU9pkQ/v6cU=
