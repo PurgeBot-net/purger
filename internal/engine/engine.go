@@ -708,6 +708,9 @@ func (e *Engine) purgeChannel(ctx context.Context, j *job.PurgeJob, channelID ui
 			if state.fallbackMessageID != 0 && msg.ID == state.fallbackMessageID {
 				continue
 			}
+			if j.SkipUserID != 0 && msg.Author.ID == snowflake.ID(j.SkipUserID) {
+				continue
+			}
 			if !e.matchesJob(ctx, j, msg, state) {
 				continue
 			}
@@ -840,34 +843,81 @@ func (e *Engine) matchesJob(ctx context.Context, j *job.PurgeJob, msg discord.Me
 		}
 	}
 
-	return e.matchesFilter(j, msg.Content, state)
+	matched := e.matchesFilter(j, msg, state)
+	if j.FilterKeep {
+		return !matched
+	}
+	return matched
 }
 
-func (e *Engine) matchesFilter(j *job.PurgeJob, content string, state *execState) bool {
+func appendAttachmentTargets(targets []string, atts []discord.Attachment) []string {
+	for _, a := range atts {
+		targets = append(targets, a.Filename)
+		// ContentType is absent on many older uploads, so the filename is matched too.
+		if a.ContentType != nil {
+			targets = append(targets, *a.ContentType)
+		}
+	}
+	return targets
+}
+
+func filterTargets(msg discord.Message) []string {
+	targets := appendAttachmentTargets([]string{msg.Content}, msg.Attachments)
+	// A forward carries its text and uploads in a snapshot, not on itself.
+	for _, snap := range msg.MessageSnapshots {
+		targets = append(targets, snap.Message.Content)
+		targets = appendAttachmentTargets(targets, snap.Message.Attachments)
+	}
+	return targets
+}
+
+func (e *Engine) matchesFilter(j *job.PurgeJob, msg discord.Message, state *execState) bool {
 	if j.Filter == "" {
 		return true
 	}
+	targets := filterTargets(msg)
+
 	if j.FilterMode == job.FilterModeRegex {
 		if state.filterRegex == nil {
 			return false
 		}
-		return state.filterRegex.MatchString(content)
+		for _, target := range targets {
+			if state.filterRegex.MatchString(target) {
+				return true
+			}
+		}
+		return false
 	}
-	text, filter := content, j.Filter
+
+	filter := j.Filter
 	if !j.CaseSensitive {
-		text = strings.ToLower(text)
 		filter = strings.ToLower(filter)
 	}
-	switch j.FilterMode {
-	case job.FilterModeExact:
-		return text == filter
-	case job.FilterModeStartsWith:
-		return strings.HasPrefix(text, filter)
-	case job.FilterModeEndsWith:
-		return strings.HasSuffix(text, filter)
-	default:
-		return strings.Contains(text, filter)
+	for _, target := range targets {
+		text := target
+		if !j.CaseSensitive {
+			text = strings.ToLower(text)
+		}
+		switch j.FilterMode {
+		case job.FilterModeExact:
+			if text == filter {
+				return true
+			}
+		case job.FilterModeStartsWith:
+			if strings.HasPrefix(text, filter) {
+				return true
+			}
+		case job.FilterModeEndsWith:
+			if strings.HasSuffix(text, filter) {
+				return true
+			}
+		default:
+			if strings.Contains(text, filter) {
+				return true
+			}
+		}
 	}
+	return false
 }
 
 // ── UI helpers ────────────────────────────────────────────────────────────────
