@@ -44,11 +44,25 @@ func New(cfg config.Config, logger *zap.Logger, db *database.Database, redis *re
 	return &Engine{cfg: cfg, logger: logger, db: db, redis: redis, client: client}
 }
 
+// A failed lookup must stay distinguishable from a confirmed absence, because
+// the inactive purge deletes on absence.
+type memberStatus int
+
+const (
+	memberStatusUnknown memberStatus = iota
+	memberStatusPresent
+	memberStatusAbsent
+)
+
+type memberLookup struct {
+	roles  []snowflake.ID
+	status memberStatus
+}
+
 // execState holds per-job state shared across channel iterations.
 type execState struct {
-	// memberRoles caches guild member role lookups.
-	// Key absent = not yet fetched. Nil value = member not in guild.
-	memberRoles map[snowflake.ID][]snowflake.ID
+	// members caches guild member lookups. Key absent = not yet fetched.
+	members map[snowflake.ID]memberLookup
 	// filterRegex is pre-compiled when FilterMode is regex; nil otherwise.
 	filterRegex *regexp.Regexp
 	// commandMessageID is the ID of the purge command's interaction response.
@@ -64,7 +78,7 @@ type execState struct {
 
 func newExecState(j *job.PurgeJob) (*execState, error) {
 	s := &execState{
-		memberRoles: make(map[snowflake.ID][]snowflake.ID),
+		members: make(map[snowflake.ID]memberLookup),
 	}
 	if j.FilterMode == job.FilterModeRegex && j.Filter != "" {
 		pattern := j.Filter
@@ -80,19 +94,27 @@ func newExecState(j *job.PurgeJob) (*execState, error) {
 	return s, nil
 }
 
-// getMemberRoles returns the member's role IDs and whether they are in the guild.
-// Results are cached to avoid repeated REST calls for the same user.
-func (s *execState) getMemberRoles(ctx context.Context, e *Engine, guildID, userID snowflake.ID) ([]snowflake.ID, bool) {
-	if roles, ok := s.memberRoles[userID]; ok {
-		return roles, roles != nil
+func memberLookupSaysAbsent(err error) bool {
+	return rest.IsJSONErrorCode(err, rest.JSONErrorCodeUnknownMember, rest.JSONErrorCodeUnknownUser)
+}
+
+// Failures are deliberately not cached, so a transient error cannot poison the
+// rest of the run.
+func (s *execState) lookupMember(ctx context.Context, e *Engine, guildID, userID snowflake.ID) ([]snowflake.ID, memberStatus) {
+	if cached, ok := s.members[userID]; ok {
+		return cached.roles, cached.status
 	}
 	member, err := e.client.Rest.GetMember(guildID, userID)
 	if err != nil {
-		s.memberRoles[userID] = nil
-		return nil, false
+		if !memberLookupSaysAbsent(err) {
+			e.logger.Warn("look up guild member", zap.Uint64("user", uint64(userID)), zap.Error(err))
+			return nil, memberStatusUnknown
+		}
+		s.members[userID] = memberLookup{status: memberStatusAbsent}
+		return nil, memberStatusAbsent
 	}
-	s.memberRoles[userID] = member.RoleIDs
-	return member.RoleIDs, true
+	s.members[userID] = memberLookup{roles: member.RoleIDs, status: memberStatusPresent}
+	return member.RoleIDs, memberStatusPresent
 }
 
 type channelResult struct {
@@ -297,9 +319,29 @@ func clearPendingDeletes(p *job.PurgeProgress) {
 	p.PendingDeleteIDs = nil
 }
 
-func (e *Engine) settlePendingDeletes(ctx context.Context, j *job.PurgeJob, progress *job.PurgeProgress) error {
+// Retrying deletes left pending by an earlier channel would blame this one for
+// their failure, and a denied channel would then abort every channel after it.
+func dropStalePendingDeletes(p *job.PurgeProgress, channelID uint64) bool {
+	if p.PendingChannelID == 0 || p.PendingChannelID == channelID {
+		return false
+	}
+	clearPendingDeletes(p)
+	return true
+}
+
+// These reject every other message in the channel too, so per-message retries
+// would be pointless.
+func deleteDeniedForChannel(err error) bool {
+	return rest.IsJSONErrorCode(err,
+		rest.JSONErrorCodeMissingAccess,
+		rest.JSONErrorCodeLackPermissionsToPerformAction,
+	)
+}
+
+// Returns how many messages it still could not remove.
+func (e *Engine) settlePendingDeletes(ctx context.Context, j *job.PurgeJob, progress *job.PurgeProgress) (int, error) {
 	if len(progress.PendingDeleteIDs) == 0 {
-		return nil
+		return 0, nil
 	}
 
 	channelID := progress.PendingChannelID
@@ -307,7 +349,7 @@ func (e *Engine) settlePendingDeletes(ctx context.Context, j *job.PurgeJob, prog
 		if progress.CurrentIndex >= len(progress.ChannelIDs) {
 			clearPendingDeletes(progress)
 			e.saveProgress(ctx, progress)
-			return nil
+			return 0, nil
 		}
 		channelID = progress.ChannelIDs[progress.CurrentIndex]
 	}
@@ -317,11 +359,11 @@ func (e *Engine) settlePendingDeletes(ctx context.Context, j *job.PurgeJob, prog
 	var reconciled int
 	for _, rawID := range progress.PendingDeleteIDs {
 		if e.isCancelled(j.ID) {
-			return ErrCancelled
+			return 0, ErrCancelled
 		}
 		if ctx.Err() != nil {
 			e.saveProgress(ctx, progress)
-			return ErrInterrupted
+			return 0, ErrInterrupted
 		}
 
 		id := snowflake.ID(rawID)
@@ -339,24 +381,68 @@ func (e *Engine) settlePendingDeletes(ctx context.Context, j *job.PurgeJob, prog
 	setPendingDeletes(progress, channelID, retry)
 	e.saveProgress(ctx, progress)
 
+	unresolved := 0
 	for _, id := range retry {
 		if e.isCancelled(j.ID) {
-			return ErrCancelled
+			return unresolved, ErrCancelled
 		}
 		if ctx.Err() != nil {
 			e.saveProgress(ctx, progress)
-			return ErrInterrupted
+			return unresolved, ErrInterrupted
 		}
 
-		if err := e.client.Rest.DeleteMessage(cid, id); err == nil || rest.IsJSONErrorCode(err, rest.JSONErrorCodeUnknownMessage) {
+		err := e.client.Rest.DeleteMessage(cid, id)
+		switch {
+		case err == nil || rest.IsJSONErrorCode(err, rest.JSONErrorCodeUnknownMessage):
 			addDeleted(progress, 1)
 			e.saveProgress(ctx, progress)
+		case deleteDeniedForChannel(err):
+			clearPendingDeletes(progress)
+			e.saveProgress(ctx, progress)
+			return unresolved, fmt.Errorf("delete message: %w", err)
+		default:
+			unresolved++
+			e.logger.Warn("delete pending message", zap.Uint64("channel", channelID), zap.Uint64("message", uint64(id)), zap.Error(err))
 		}
 	}
 
 	clearPendingDeletes(progress)
 	e.saveProgress(ctx, progress)
-	return nil
+	return unresolved, nil
+}
+
+// Discord rejects a bulk delete as a whole, so a rejected batch is retried
+// message by message rather than lost. Returns how many still failed.
+func (e *Engine) deleteBatch(ctx context.Context, j *job.PurgeJob, progress *job.PurgeProgress, channelID uint64, batch []snowflake.ID) (int, error) {
+	cid := snowflake.ID(channelID)
+	setPendingDeletes(progress, channelID, batch)
+	e.saveProgress(ctx, progress)
+
+	var err error
+	if len(batch) == 1 {
+		err = e.client.Rest.DeleteMessage(cid, batch[0])
+		if rest.IsJSONErrorCode(err, rest.JSONErrorCodeUnknownMessage) {
+			err = nil
+		}
+	} else {
+		err = e.client.Rest.BulkDeleteMessages(cid, batch)
+	}
+
+	if err == nil {
+		addDeleted(progress, len(batch))
+		clearPendingDeletes(progress)
+		e.saveProgress(ctx, progress)
+		return 0, nil
+	}
+	if deleteDeniedForChannel(err) {
+		clearPendingDeletes(progress)
+		e.saveProgress(ctx, progress)
+		return 0, fmt.Errorf("delete messages: %w", err)
+	}
+
+	e.logger.Warn("delete messages, retrying individually",
+		zap.Uint64("channel", channelID), zap.Int("count", len(batch)), zap.Error(err))
+	return e.settlePendingDeletes(ctx, j, progress)
 }
 
 // Execute runs a purge job end-to-end.
@@ -672,11 +758,18 @@ func (e *Engine) fetchThreadsForChannels(ctx context.Context, guildID uint64, pa
 // purgeChannel fetches and deletes matching messages from a single channel or thread.
 func (e *Engine) purgeChannel(ctx context.Context, j *job.PurgeJob, channelID uint64, state *execState, progress *job.PurgeProgress) error {
 	cid := snowflake.ID(channelID)
+	unresolved := 0
+
+	if dropStalePendingDeletes(progress, channelID) {
+		e.saveProgress(ctx, progress)
+	}
 
 	for {
-		if err := e.settlePendingDeletes(ctx, j, progress); err != nil {
+		settled, err := e.settlePendingDeletes(ctx, j, progress)
+		if err != nil {
 			return err
 		}
+		unresolved += settled
 		if e.isCancelled(j.ID) {
 			return ErrCancelled
 		}
@@ -715,6 +808,10 @@ func (e *Engine) purgeChannel(ctx context.Context, j *job.PurgeJob, channelID ui
 			if slices.Contains(j.SkipMessageIDs, uint64(msg.ID)) {
 				continue
 			}
+			// One of these in a bulk delete takes the whole batch down with it.
+			if !msg.Type.Deleteable() {
+				continue
+			}
 			if !e.matchesJob(ctx, j, msg, state) {
 				continue
 			}
@@ -744,21 +841,11 @@ func (e *Engine) purgeChannel(ctx context.Context, j *job.PurgeJob, channelID ui
 				batch = toDelete[:100]
 			}
 			toDelete = toDelete[len(batch):]
-			setPendingDeletes(progress, channelID, batch)
-			e.saveProgress(ctx, progress)
-			deleted := 0
-			if len(batch) == 1 {
-				if e.client.Rest.DeleteMessage(cid, batch[0]) == nil {
-					deleted = 1
-				}
-			} else {
-				if err := e.client.Rest.BulkDeleteMessages(cid, batch); err == nil {
-					deleted = len(batch)
-				}
+			failed, err := e.deleteBatch(ctx, j, progress, channelID, batch)
+			if err != nil {
+				return err
 			}
-			addDeleted(progress, deleted)
-			clearPendingDeletes(progress)
-			e.saveProgress(ctx, progress)
+			unresolved += failed
 		}
 		for _, id := range oldMessages {
 			if e.isCancelled(j.ID) {
@@ -768,13 +855,11 @@ func (e *Engine) purgeChannel(ctx context.Context, j *job.PurgeJob, channelID ui
 				e.saveProgress(ctx, progress)
 				return ErrInterrupted
 			}
-			setPendingDeletes(progress, channelID, []snowflake.ID{id})
-			e.saveProgress(ctx, progress)
-			if e.client.Rest.DeleteMessage(cid, id) == nil {
-				addDeleted(progress, 1)
+			failed, err := e.deleteBatch(ctx, j, progress, channelID, []snowflake.ID{id})
+			if err != nil {
+				return err
 			}
-			clearPendingDeletes(progress)
-			e.saveProgress(ctx, progress)
+			unresolved += failed
 		}
 
 		progress.BeforeID = nextBeforeID
@@ -785,12 +870,44 @@ func (e *Engine) purgeChannel(ctx context.Context, j *job.PurgeJob, channelID ui
 		}
 	}
 
+	if unresolved > 0 {
+		return fmt.Errorf("%d message(s) could not be deleted", unresolved)
+	}
 	return nil
 }
 
+// Interaction replies arrive as webhook messages whose webhook ID is the
+// application's own, so they otherwise look like webhook posts.
+func isInteractionResponse(msg discord.Message) bool {
+	if msg.InteractionMetadata != nil || msg.Interaction != nil {
+		return true
+	}
+	// Replies predating interaction_metadata carry neither field.
+	return msg.ApplicationID != nil && msg.WebhookID != nil && *msg.WebhookID == *msg.ApplicationID
+}
+
+// webhook_id alone is not this test: an interaction reply carries one too, but its
+// author is the app's own bot user, which is a member and can hold roles.
+func authorIsWebhook(msg discord.Message) bool {
+	return msg.WebhookID != nil && !isInteractionResponse(msg)
+}
+
+// Migrated accounts report discriminator "0"; only pre-migration ones report "0000".
+func isDeletedAccount(u discord.User) bool {
+	if !strings.HasPrefix(u.Username, "Deleted User") {
+		return false
+	}
+	return u.Discriminator == "0" || u.Discriminator == "0000"
+}
+
 // matchesJob returns true if the message should be deleted.
+//
+// Discord makes a webhook post's author the webhook and flags it as a bot, so
+// Author.Bot cannot separate the two and a membership lookup always comes back
+// absent. Every branch below states what it does with fromWebhook.
 func (e *Engine) matchesJob(ctx context.Context, j *job.PurgeJob, msg discord.Message, state *execState) bool {
 	guildID := snowflake.ID(j.GuildID)
+	fromWebhook := authorIsWebhook(msg)
 
 	switch j.PurgeType {
 	case job.PurgeTypeUser:
@@ -799,50 +916,53 @@ func (e *Engine) matchesJob(ctx context.Context, j *job.PurgeJob, msg discord.Me
 		}
 
 	case job.PurgeTypeRole:
-		roles, isMember := state.getMemberRoles(ctx, e, guildID, msg.Author.ID)
-		if !isMember {
+		if fromWebhook {
 			return false
 		}
-		hasRole := false
-		for _, r := range roles {
-			if uint64(r) == j.FilterRoleID {
-				hasRole = true
-				break
-			}
+		if !j.IncludeBots && msg.Author.Bot {
+			return false
 		}
-		if !hasRole {
+		roles, status := state.lookupMember(ctx, e, guildID, msg.Author.ID)
+		if status != memberStatusPresent {
+			return false
+		}
+		// @everyone's ID is the guild's, and Discord omits it from a member's roles.
+		if j.FilterRoleID != j.GuildID && !slices.Contains(roles, snowflake.ID(j.FilterRoleID)) {
 			return false
 		}
 
 	case job.PurgeTypeEveryone:
+		// Not fromWebhook: on a crosspost, Author.Bot is the original human author.
 		if !j.IncludeBots && msg.Author.Bot {
 			return false
 		}
 
 	case job.PurgeTypeBot:
-		if !msg.Author.Bot {
+		if fromWebhook || !msg.Author.Bot {
 			return false
 		}
 
 	case job.PurgeTypeInactive:
+		if fromWebhook || msg.Author.System {
+			return false
+		}
 		if !j.IncludeBots && msg.Author.Bot {
 			return false
 		}
-		_, isMember := state.getMemberRoles(ctx, e, guildID, msg.Author.ID)
-		if isMember {
+		if _, status := state.lookupMember(ctx, e, guildID, msg.Author.ID); status != memberStatusAbsent {
 			return false
 		}
 
 	case job.PurgeTypeWebhook:
-		if msg.WebhookID == nil {
+		if !fromWebhook {
 			return false
 		}
 
 	case job.PurgeTypeDeleted:
-		if msg.Author.Bot {
+		if fromWebhook || msg.Author.Bot {
 			return false
 		}
-		if !strings.HasPrefix(msg.Author.Username, "Deleted User") || msg.Author.Discriminator != "0000" {
+		if !isDeletedAccount(msg.Author) {
 			return false
 		}
 	}
