@@ -389,6 +389,15 @@ func abortReason(ctx context.Context) error {
 	return nil
 }
 
+// An aborted context surfaces as a transport error, not a Discord error code, so a REST
+// failure has to be re-read against the context before it counts as a real failure.
+func abortedDuring(ctx context.Context, err error) error {
+	if err == nil {
+		return nil
+	}
+	return abortReason(ctx)
+}
+
 // These reject every other message in the channel too, so per-message retries
 // would be pointless.
 func deleteDeniedForChannel(err error) bool {
@@ -461,6 +470,10 @@ func (e *Engine) settlePendingDeletes(ctx context.Context, state *execState, ch 
 			retry = append(retry, id)
 		} else if rest.IsJSONErrorCode(err, rest.JSONErrorCodeUnknownMessage) {
 			reconciled++
+		} else if reason := abortedDuring(ctx, err); reason != nil {
+			// Leaves PendingDeleteIDs whole so recovery redoes the batch.
+			e.commit(ctx, state, nil)
+			return 0, reason
 		} else {
 			e.logger.Warn("check pending deleted message", zap.Uint64("channel", channelID), zap.Uint64("message", rawID), zap.Error(err))
 			retry = append(retry, id)
@@ -486,10 +499,11 @@ func (e *Engine) settlePendingDeletes(ctx context.Context, state *execState, ch 
 		case deleteDeniedForChannel(err):
 			e.commit(ctx, state, func() { clearPendingDeletes(ch) })
 			return unresolved, fmt.Errorf("delete message: %w", err)
-		case ctx.Err() != nil:
-			e.commit(ctx, state, nil)
-			return unresolved, ErrInterrupted
 		default:
+			if reason := abortedDuring(ctx, err); reason != nil {
+				e.commit(ctx, state, nil)
+				return unresolved, reason
+			}
 			unresolved++
 			e.logger.Warn("delete pending message", zap.Uint64("channel", channelID), zap.Uint64("message", uint64(id)), zap.Error(err))
 		}
@@ -532,9 +546,9 @@ func (e *Engine) deleteBatch(ctx context.Context, state *execState, ch *job.Purg
 
 	// Neither is one bad message in the batch, so splitting it up would only multiply
 	// the load Discord just refused.
-	if ctx.Err() != nil {
+	if reason := abortedDuring(ctx, err); reason != nil {
 		e.commit(ctx, state, nil)
-		return 0, ErrInterrupted
+		return 0, reason
 	}
 	if ratelimit.IsTooManyRequests(err) {
 		e.commit(ctx, state, func() { clearPendingDeletes(ch) })
