@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/disgoorg/disgo"
@@ -21,11 +22,12 @@ import (
 )
 
 type Worker struct {
-	cfg    config.Config
-	logger *zap.Logger
-	db     *database.Database
-	redis  *redis.Client
-	client *bot.Client
+	cfg     config.Config
+	logger  *zap.Logger
+	db      *database.Database
+	redis   *redis.Client
+	client  *bot.Client
+	running atomic.Int64
 }
 
 func New(cfg config.Config, logger *zap.Logger, db *database.Database, redis *redis.Client) (*Worker, error) {
@@ -81,36 +83,41 @@ func (w *Worker) loop(ctx context.Context, eng *engine.Engine) {
 		if j == nil {
 			continue // timeout, loop again
 		}
+		jobLog := w.logger.With(zap.String("id", j.ID), zap.Uint64("guild_id", j.GuildID))
 
 		// Guard against double-enqueue: skip if this is a stale copy of a recovered job.
 		active, err := job.GetActiveJob(ctx, w.redis, j.GuildID)
 		if err != nil {
-			w.logger.Error("verify active job", zap.String("id", j.ID), zap.Error(err))
+			jobLog.Error("verify active job", zap.Error(err))
 			continue
 		}
 		if active == nil || active.ID != j.ID {
-			w.logger.Info("skipping stale recovered job", zap.String("id", j.ID), zap.Uint64("guild_id", j.GuildID))
+			jobLog.Info("skipping stale recovered job")
 			continue
 		}
 
-		w.logger.Info("processing purge job",
-			zap.String("id", j.ID),
-			zap.Uint64("guild_id", j.GuildID),
+		running := w.running.Add(1)
+		jobLog.Info("processing purge job",
 			zap.String("type", string(j.PurgeType)),
+			zap.Int64("running", running),
 		)
 
 		err = eng.Execute(ctx, j)
+		// Not deferred: extracting a function to reach one would drag the cleanup
+		// below into the interrupt path, which must skip it.
+		running = w.running.Add(-1)
+
 		if errors.Is(err, engine.ErrInterrupted) {
-			w.logger.Info("purge job interrupted; leaving active for recovery", zap.String("id", j.ID))
+			jobLog.Info("purge job interrupted; leaving active for recovery", zap.Int64("running", running))
 			return
 		}
 
 		cleanupCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		if err != nil {
 			if errors.Is(err, engine.ErrCancelled) {
-				w.logger.Info("purge job cancelled", zap.String("id", j.ID))
+				jobLog.Info("purge job cancelled", zap.Int64("running", running))
 			} else {
-				w.logger.Error("purge job failed", zap.String("id", j.ID), zap.Error(err))
+				jobLog.Error("purge job failed", zap.Int64("running", running), zap.Error(err))
 			}
 		}
 		job.DeleteProgress(cleanupCtx, w.redis, j.ID)

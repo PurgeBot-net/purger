@@ -26,11 +26,11 @@ import (
 )
 
 const (
-	bulkDeleteMaxAge   = 14 * 24 * time.Hour
-	fetchBatchSize     = 100
-	bulkDeleteMaxBatch = 100
-	maxPagesBeforeFlush = 20
-	cancelPollInterval = time.Second
+	bulkDeleteMaxAge      = 14 * 24 * time.Hour
+	fetchBatchSize        = 100
+	bulkDeleteMaxBatch    = 100
+	maxPagesBeforeFlush   = 20
+	cancelPollInterval    = time.Second
 	statusRefreshInterval = 5 * time.Second
 )
 
@@ -642,6 +642,8 @@ func (e *Engine) Execute(ctx context.Context, j *job.PurgeJob) error {
 	state.fallbackChannelID = fallbackChanID
 	state.fallbackMessageID = fallbackMsgID
 
+	resumed := progress != nil
+
 	if progress == nil {
 		channels, err := e.resolveChannels(ctx, j)
 		if err != nil {
@@ -796,7 +798,26 @@ func (e *Engine) Execute(ctx context.Context, j *job.PurgeJob) error {
 
 	totalDeleted := state.totalDeleted()
 	elapsed := time.Since(progress.StartedAt)
-	e.sendCompletion(ctx, j, state, target, totalDeleted, elapsed, state.results(), showBranding)
+	results := state.results()
+	failed := 0
+	for _, r := range results {
+		if r.err != nil {
+			failed++
+		}
+	}
+
+	// deleted is cumulative across attempts, duration is only this run.
+	e.logger.Info("purge job completed",
+		zap.String("id", j.ID),
+		zap.Uint64("guild_id", j.GuildID),
+		zap.Int("deleted", totalDeleted),
+		zap.Int("channels", len(results)),
+		zap.Int("failed", failed),
+		zap.Bool("resumed", resumed),
+		zap.Duration("duration", time.Since(start)),
+	)
+
+	e.sendCompletion(ctx, j, state, target, totalDeleted, elapsed, results, showBranding)
 
 	if err := e.db.RecordPurgeEvent(ctx, database.RecordPurgeEventParams{
 		GuildID:    int64(j.GuildID),
