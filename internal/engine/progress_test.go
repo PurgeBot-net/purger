@@ -1,7 +1,10 @@
 package engine
 
 import (
+	"context"
+	"errors"
 	"testing"
+	"time"
 
 	"github.com/PurgeBot-net/common/job"
 	"github.com/disgoorg/disgo/discord"
@@ -11,8 +14,7 @@ import (
 
 func TestEnsureChannelProgressBackfillsChannels(t *testing.T) {
 	progress := &job.PurgeProgress{
-		ChannelIDs:   []uint64{100, 200, 300},
-		CurrentIndex: 9,
+		ChannelIDs: []uint64{100, 200, 300},
 		Channels: []job.PurgeChannelProgress{
 			{ChannelID: 100, Deleted: 2, Done: true},
 		},
@@ -20,9 +22,6 @@ func TestEnsureChannelProgressBackfillsChannels(t *testing.T) {
 
 	ensureChannelProgress(progress)
 
-	if progress.CurrentIndex != len(progress.ChannelIDs) {
-		t.Fatalf("current index was not clamped: %d", progress.CurrentIndex)
-	}
 	if len(progress.Channels) != len(progress.ChannelIDs) {
 		t.Fatalf("channels were not backfilled: %#v", progress.Channels)
 	}
@@ -60,19 +59,61 @@ func TestChannelResultsFromProgressIncludesCompletedAndErroredChannels(t *testin
 }
 
 func TestPendingDeletesHelpers(t *testing.T) {
-	progress := &job.PurgeProgress{}
+	ch := &job.PurgeChannelProgress{ChannelID: 100}
 
-	setPendingDeletes(progress, 100, []snowflake.ID{200, 300})
-	if progress.PendingChannelID != 100 {
-		t.Fatalf("pending channel mismatch: %d", progress.PendingChannelID)
-	}
-	if len(progress.PendingDeleteIDs) != 2 || progress.PendingDeleteIDs[0] != 200 || progress.PendingDeleteIDs[1] != 300 {
-		t.Fatalf("pending delete IDs mismatch: %#v", progress.PendingDeleteIDs)
+	setPendingDeletes(ch, []snowflake.ID{200, 300})
+	if len(ch.PendingDeleteIDs) != 2 || ch.PendingDeleteIDs[0] != 200 || ch.PendingDeleteIDs[1] != 300 {
+		t.Fatalf("pending delete IDs mismatch: %#v", ch.PendingDeleteIDs)
 	}
 
-	clearPendingDeletes(progress)
-	if progress.PendingChannelID != 0 || progress.PendingDeleteIDs != nil {
-		t.Fatalf("pending deletes were not cleared: %#v", progress)
+	clearPendingDeletes(ch)
+	if ch.PendingDeleteIDs != nil {
+		t.Fatalf("pending deletes were not cleared: %#v", ch)
+	}
+}
+
+func TestEnsureChannelProgressMatchesByChannelID(t *testing.T) {
+	// Entries stored out of order must follow their channel, not their position,
+	// or deletions get credited to the wrong channel.
+	progress := &job.PurgeProgress{
+		ChannelIDs: []uint64{100, 200, 300},
+		Channels: []job.PurgeChannelProgress{
+			{ChannelID: 300, Deleted: 7, Done: true},
+			{ChannelID: 100, Deleted: 2, BeforeID: 55},
+		},
+	}
+
+	ensureChannelProgress(progress)
+
+	if len(progress.Channels) != 3 {
+		t.Fatalf("channels were not resized: %#v", progress.Channels)
+	}
+	if progress.Channels[0].ChannelID != 100 || progress.Channels[0].Deleted != 2 || progress.Channels[0].BeforeID != 55 {
+		t.Fatalf("channel 100 lost its progress: %#v", progress.Channels[0])
+	}
+	if progress.Channels[1].ChannelID != 200 || progress.Channels[1].Deleted != 0 {
+		t.Fatalf("channel 200 was not backfilled empty: %#v", progress.Channels[1])
+	}
+	if progress.Channels[2].ChannelID != 300 || progress.Channels[2].Deleted != 7 || !progress.Channels[2].Done {
+		t.Fatalf("channel 300 lost its progress: %#v", progress.Channels[2])
+	}
+}
+
+func TestAbortReasonDistinguishesCancelFromShutdown(t *testing.T) {
+	if reason := abortReason(context.Background()); reason != nil {
+		t.Fatalf("a live context is not an abort: %v", reason)
+	}
+
+	cancelled, abort := context.WithCancelCause(context.Background())
+	abort(ErrCancelled)
+	if reason := abortReason(cancelled); !errors.Is(reason, ErrCancelled) {
+		t.Fatalf("user cancel should stay distinguishable: %v", reason)
+	}
+
+	shutdown, stop := context.WithCancel(context.Background())
+	stop()
+	if reason := abortReason(shutdown); !errors.Is(reason, ErrInterrupted) {
+		t.Fatalf("shutdown should read as interrupted: %v", reason)
 	}
 }
 
@@ -120,5 +161,64 @@ func TestStatusFallbackErrorPredicates(t *testing.T) {
 	}
 	if shouldReplaceStatusMessageAfterUpdateError(&rest.Error{Code: rest.JSONErrorCodeInvalidWebhookToken}) {
 		t.Fatal("invalid webhook token is not a channel-message update failure")
+	}
+}
+
+func ids(n int) []snowflake.ID {
+	out := make([]snowflake.ID, n)
+	for i := range out {
+		out[i] = snowflake.ID(i + 1)
+	}
+	return out
+}
+
+func TestNextBatchCapsAtBulkDeleteLimit(t *testing.T) {
+	batch, rest := nextBatch(nil)
+	if len(batch) != 0 || len(rest) != 0 {
+		t.Fatalf("empty buffer: got %d and %d", len(batch), len(rest))
+	}
+
+	batch, rest = nextBatch(ids(1))
+	if len(batch) != 1 || len(rest) != 0 {
+		t.Fatalf("single id: got %d and %d", len(batch), len(rest))
+	}
+
+	batch, rest = nextBatch(ids(bulkDeleteMaxBatch))
+	if len(batch) != bulkDeleteMaxBatch || len(rest) != 0 {
+		t.Fatalf("exactly one batch: got %d and %d", len(batch), len(rest))
+	}
+
+	// Only reachable now that a page can top up an almost-full buffer.
+	batch, rest = nextBatch(ids(199))
+	if len(batch) != bulkDeleteMaxBatch || len(rest) != 99 {
+		t.Fatalf("overfull buffer: got %d and %d", len(batch), len(rest))
+	}
+	if batch[0] != snowflake.ID(1) || rest[0] != snowflake.ID(bulkDeleteMaxBatch+1) {
+		t.Fatalf("split lost ordering: %v then %v", batch[0], rest[0])
+	}
+}
+
+func TestShouldFlush(t *testing.T) {
+	if shouldFlush(bulkDeleteMaxBatch-1, 1) {
+		t.Fatal("a partial batch early in a channel should keep accumulating")
+	}
+	if !shouldFlush(bulkDeleteMaxBatch, 1) {
+		t.Fatal("a full batch should flush")
+	}
+	if !shouldFlush(0, maxPagesBeforeFlush) {
+		t.Fatal("a sparse channel should still checkpoint")
+	}
+}
+
+func TestSplitAgedOut(t *testing.T) {
+	fresh := snowflake.New(time.Now().Add(-time.Hour))
+	aged := snowflake.New(time.Now().Add(-bulkDeleteMaxAge - time.Hour))
+
+	gotFresh, gotAged := splitAgedOut([]snowflake.ID{fresh, aged, fresh})
+	if len(gotFresh) != 2 {
+		t.Fatalf("recent messages should stay bulk-deletable: %v", gotFresh)
+	}
+	if len(gotAged) != 1 || gotAged[0] != aged {
+		t.Fatalf("a message that aged past 14 days must leave the batch: %v", gotAged)
 	}
 }

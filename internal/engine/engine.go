@@ -7,6 +7,7 @@ import (
 	"regexp"
 	"slices"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/disgoorg/disgo/bot"
@@ -15,16 +16,22 @@ import (
 	"github.com/disgoorg/snowflake/v2"
 	"github.com/redis/go-redis/v9"
 	"go.uber.org/zap"
+	"golang.org/x/sync/errgroup"
 
 	"github.com/PurgeBot-net/common/job"
 	"github.com/PurgeBot-net/database"
 	"github.com/PurgeBot-net/locale"
 	"github.com/PurgeBot-net/purger/config"
+	"github.com/PurgeBot-net/purger/internal/ratelimit"
 )
 
 const (
-	bulkDeleteMaxAge = 14 * 24 * time.Hour
-	fetchBatchSize   = 100
+	bulkDeleteMaxAge   = 14 * 24 * time.Hour
+	fetchBatchSize     = 100
+	bulkDeleteMaxBatch = 100
+	maxPagesBeforeFlush = 20
+	cancelPollInterval = time.Second
+	statusRefreshInterval = 5 * time.Second
 )
 
 var (
@@ -59,26 +66,39 @@ type memberLookup struct {
 	status memberStatus
 }
 
-// execState holds per-job state shared across channel iterations.
 type execState struct {
+	// job.SaveProgress marshals the whole blob and writes UpdatedAt back into it,
+	// so the save runs under mu alongside the mutations.
+	mu       sync.Mutex
+	progress *job.PurgeProgress
+
 	// members caches guild member lookups. Key absent = not yet fetched.
-	members map[snowflake.ID]memberLookup
+	membersMu sync.RWMutex
+	members   map[snowflake.ID]memberLookup
+
+	// excluded holds the bot's own status messages. Append-only: the UI can
+	// replace its message mid-run, and clearing the set would leave a window in
+	// which a channel goroutine deletes the replacement.
+	excludedMu sync.RWMutex
+	excluded   map[snowflake.ID]bool
+
 	// filterRegex is pre-compiled when FilterMode is regex; nil otherwise.
 	filterRegex *regexp.Regexp
+
+	// The status-message fields below are written only by the parent goroutine.
 	// commandMessageID is the ID of the purge command's interaction response.
-	// It is always excluded from deletion regardless of purge settings.
 	commandMessageID snowflake.ID
 	// fallbackChannelID and fallbackMessageID are used when the interaction
 	// token has expired (e.g. after a worker crash/restart). Status updates
 	// are sent by editing a regular channel message instead.
 	fallbackChannelID snowflake.ID
 	fallbackMessageID snowflake.ID
-	progress          *job.PurgeProgress
 }
 
 func newExecState(j *job.PurgeJob) (*execState, error) {
 	s := &execState{
-		members: make(map[snowflake.ID]memberLookup),
+		members:  make(map[snowflake.ID]memberLookup),
+		excluded: make(map[snowflake.ID]bool),
 	}
 	if j.FilterMode == job.FilterModeRegex && j.Filter != "" {
 		pattern := j.Filter
@@ -99,9 +119,14 @@ func memberLookupSaysAbsent(err error) bool {
 }
 
 // Failures are deliberately not cached, so a transient error cannot poison the
-// rest of the run.
+// rest of the run. The REST call runs unlocked so a slow lookup does not block
+// cache hits in the other channels; a duplicated lookup is harmless, and disgo
+// serialises them anyway because the bucket is keyed on the guild.
 func (s *execState) lookupMember(ctx context.Context, e *Engine, guildID, userID snowflake.ID) ([]snowflake.ID, memberStatus) {
-	if cached, ok := s.members[userID]; ok {
+	s.membersMu.RLock()
+	cached, ok := s.members[userID]
+	s.membersMu.RUnlock()
+	if ok {
 		return cached.roles, cached.status
 	}
 	member, err := e.client.Rest.GetMember(guildID, userID)
@@ -110,11 +135,45 @@ func (s *execState) lookupMember(ctx context.Context, e *Engine, guildID, userID
 			e.logger.Warn("look up guild member", zap.Uint64("user", uint64(userID)), zap.Error(err))
 			return nil, memberStatusUnknown
 		}
-		s.members[userID] = memberLookup{status: memberStatusAbsent}
+		s.storeMember(userID, memberLookup{status: memberStatusAbsent})
 		return nil, memberStatusAbsent
 	}
-	s.members[userID] = memberLookup{roles: member.RoleIDs, status: memberStatusPresent}
+	s.storeMember(userID, memberLookup{roles: member.RoleIDs, status: memberStatusPresent})
 	return member.RoleIDs, memberStatusPresent
+}
+
+func (s *execState) storeMember(userID snowflake.ID, lookup memberLookup) {
+	s.membersMu.Lock()
+	defer s.membersMu.Unlock()
+	s.members[userID] = lookup
+}
+
+func (s *execState) exclude(ids ...snowflake.ID) {
+	s.excludedMu.Lock()
+	defer s.excludedMu.Unlock()
+	for _, id := range ids {
+		if id != 0 {
+			s.excluded[id] = true
+		}
+	}
+}
+
+func (s *execState) isExcluded(id snowflake.ID) bool {
+	s.excludedMu.RLock()
+	defer s.excludedMu.RUnlock()
+	return s.excluded[id]
+}
+
+func (s *execState) totalDeleted() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.progress.TotalDeleted
+}
+
+func (s *execState) results() []channelResult {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return channelResultsFromProgress(s.progress)
 }
 
 type channelResult struct {
@@ -123,35 +182,25 @@ type channelResult struct {
 	err     error
 }
 
+// Matched by channel ID, not position, so entries that drifted out of order cannot
+// credit deletions to the wrong channel. Call once, before any goroutine takes a
+// pointer into Channels.
 func ensureChannelProgress(p *job.PurgeProgress) {
-	if p.CurrentIndex < 0 {
-		p.CurrentIndex = 0
-	}
-	if len(p.Channels) < len(p.ChannelIDs) {
-		existing := len(p.Channels)
-		for i := existing; i < len(p.ChannelIDs); i++ {
-			p.Channels = append(p.Channels, job.PurgeChannelProgress{ChannelID: p.ChannelIDs[i]})
+	stored := make(map[uint64]job.PurgeChannelProgress, len(p.Channels))
+	for _, ch := range p.Channels {
+		if ch.ChannelID != 0 {
+			stored[ch.ChannelID] = ch
 		}
 	}
-	if len(p.Channels) > len(p.ChannelIDs) {
-		p.Channels = p.Channels[:len(p.ChannelIDs)]
-	}
+	channels := make([]job.PurgeChannelProgress, len(p.ChannelIDs))
 	for i, id := range p.ChannelIDs {
-		if p.Channels[i].ChannelID == 0 {
-			p.Channels[i].ChannelID = id
+		if existing, ok := stored[id]; ok {
+			channels[i] = existing
+			continue
 		}
+		channels[i] = job.PurgeChannelProgress{ChannelID: id}
 	}
-	if p.CurrentIndex > len(p.ChannelIDs) {
-		p.CurrentIndex = len(p.ChannelIDs)
-	}
-}
-
-func currentChannelProgress(p *job.PurgeProgress) *job.PurgeChannelProgress {
-	ensureChannelProgress(p)
-	if p.CurrentIndex >= len(p.Channels) {
-		return nil
-	}
-	return &p.Channels[p.CurrentIndex]
+	p.Channels = channels
 }
 
 func channelResultsFromProgress(p *job.PurgeProgress) []channelResult {
@@ -227,6 +276,7 @@ func (e *Engine) adoptInteractionResponseTarget(ctx context.Context, j *job.Purg
 	}
 	if msg.ID != 0 {
 		state.commandMessageID = msg.ID
+		state.exclude(msg.ID)
 	}
 	if channelID, messageID, ok := statusTargetFromInteractionResponse(msg); ok {
 		e.setStatusTarget(ctx, state, channelID, messageID)
@@ -252,6 +302,7 @@ func (e *Engine) dismissStaleInteractionMessage(j *job.PurgeJob, state *execStat
 func (e *Engine) setStatusTarget(ctx context.Context, state *execState, channelID, messageID snowflake.ID) {
 	state.fallbackChannelID = channelID
 	state.fallbackMessageID = messageID
+	state.exclude(messageID)
 	e.persistMessageTargets(ctx, state)
 }
 
@@ -265,6 +316,8 @@ func (e *Engine) persistMessageTargets(ctx context.Context, state *execState) {
 	if state.progress == nil {
 		return
 	}
+	state.mu.Lock()
+	defer state.mu.Unlock()
 	changed := false
 	if state.commandMessageID != 0 && state.progress.CommandMessageID != uint64(state.commandMessageID) {
 		state.progress.CommandMessageID = uint64(state.commandMessageID)
@@ -294,39 +347,46 @@ func (e *Engine) isCancelled(jobID string) bool {
 	return cancelled
 }
 
-func addDeleted(p *job.PurgeProgress, n int) {
-	if n <= 0 {
-		return
+// Every write to progress goes through here, so a mutation cannot interleave with
+// another goroutine marshalling the blob.
+func (e *Engine) commit(ctx context.Context, state *execState, mutate func()) {
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	if mutate != nil {
+		mutate()
 	}
-	ch := currentChannelProgress(p)
-	if ch == nil {
+	e.saveProgress(ctx, state.progress)
+}
+
+func addDeleted(p *job.PurgeProgress, ch *job.PurgeChannelProgress, n int) {
+	if n <= 0 || ch == nil {
 		return
 	}
 	ch.Deleted += n
 	p.TotalDeleted += n
 }
 
-func setPendingDeletes(p *job.PurgeProgress, channelID uint64, ids []snowflake.ID) {
-	p.PendingChannelID = channelID
-	p.PendingDeleteIDs = make([]uint64, len(ids))
+func setPendingDeletes(ch *job.PurgeChannelProgress, ids []snowflake.ID) {
+	ch.PendingDeleteIDs = make([]uint64, len(ids))
 	for i, id := range ids {
-		p.PendingDeleteIDs[i] = uint64(id)
+		ch.PendingDeleteIDs[i] = uint64(id)
 	}
 }
 
-func clearPendingDeletes(p *job.PurgeProgress) {
-	p.PendingChannelID = 0
-	p.PendingDeleteIDs = nil
+func clearPendingDeletes(ch *job.PurgeChannelProgress) {
+	ch.PendingDeleteIDs = nil
 }
 
-// Retrying deletes left pending by an earlier channel would blame this one for
-// their failure, and a denied channel would then abort every channel after it.
-func dropStalePendingDeletes(p *job.PurgeProgress, channelID uint64) bool {
-	if p.PendingChannelID == 0 || p.PendingChannelID == channelID {
-		return false
+// worker.go branches on the difference: an interrupted job stays active for
+// recovery, a cancelled one is cleaned up.
+func abortReason(ctx context.Context) error {
+	if errors.Is(context.Cause(ctx), ErrCancelled) {
+		return ErrCancelled
 	}
-	clearPendingDeletes(p)
-	return true
+	if ctx.Err() != nil {
+		return ErrInterrupted
+	}
+	return nil
 }
 
 // These reject every other message in the channel too, so per-message retries
@@ -338,36 +398,66 @@ func deleteDeniedForChannel(err error) bool {
 	)
 }
 
+func shouldFlush(buffered, pagesSinceFlush int) bool {
+	return buffered >= bulkDeleteMaxBatch || pagesSinceFlush >= maxPagesBeforeFlush
+}
+
+func nextBatch(buffered []snowflake.ID) ([]snowflake.ID, []snowflake.ID) {
+	if len(buffered) > bulkDeleteMaxBatch {
+		return buffered[:bulkDeleteMaxBatch], buffered[bulkDeleteMaxBatch:]
+	}
+	return buffered, nil
+}
+
+// A message can cross the 14-day line while it waits in the buffer, and a single
+// one that has rejects the whole bulk delete.
+func splitAgedOut(buffered []snowflake.ID) (fresh, aged []snowflake.ID) {
+	cutoff := time.Now().Add(-bulkDeleteMaxAge)
+	for _, id := range buffered {
+		if id.Time().After(cutoff) {
+			fresh = append(fresh, id)
+		} else {
+			aged = append(aged, id)
+		}
+	}
+	return fresh, aged
+}
+
+func (e *Engine) deleteEach(ctx context.Context, state *execState, ch *job.PurgeChannelProgress, ids []snowflake.ID) (int, error) {
+	unresolved := 0
+	for _, id := range ids {
+		if reason := abortReason(ctx); reason != nil {
+			e.commit(ctx, state, nil)
+			return unresolved, reason
+		}
+		failed, err := e.deleteBatch(ctx, state, ch, []snowflake.ID{id})
+		if err != nil {
+			return unresolved, err
+		}
+		unresolved += failed
+	}
+	return unresolved, nil
+}
+
 // Returns how many messages it still could not remove.
-func (e *Engine) settlePendingDeletes(ctx context.Context, j *job.PurgeJob, progress *job.PurgeProgress) (int, error) {
-	if len(progress.PendingDeleteIDs) == 0 {
+func (e *Engine) settlePendingDeletes(ctx context.Context, state *execState, ch *job.PurgeChannelProgress) (int, error) {
+	if len(ch.PendingDeleteIDs) == 0 {
 		return 0, nil
 	}
 
-	channelID := progress.PendingChannelID
-	if channelID == 0 {
-		if progress.CurrentIndex >= len(progress.ChannelIDs) {
-			clearPendingDeletes(progress)
-			e.saveProgress(ctx, progress)
-			return 0, nil
-		}
-		channelID = progress.ChannelIDs[progress.CurrentIndex]
-	}
+	channelID := ch.ChannelID
 	cid := snowflake.ID(channelID)
 
 	var retry []snowflake.ID
 	var reconciled int
-	for _, rawID := range progress.PendingDeleteIDs {
-		if e.isCancelled(j.ID) {
-			return 0, ErrCancelled
-		}
-		if ctx.Err() != nil {
-			e.saveProgress(ctx, progress)
-			return 0, ErrInterrupted
+	for _, rawID := range ch.PendingDeleteIDs {
+		if reason := abortReason(ctx); reason != nil {
+			e.commit(ctx, state, nil)
+			return 0, reason
 		}
 
 		id := snowflake.ID(rawID)
-		if _, err := e.client.Rest.GetMessage(cid, id); err == nil {
+		if _, err := e.client.Rest.GetMessage(cid, id, rest.WithCtx(ctx)); err == nil {
 			retry = append(retry, id)
 		} else if rest.IsJSONErrorCode(err, rest.JSONErrorCodeUnknownMessage) {
 			reconciled++
@@ -377,72 +467,85 @@ func (e *Engine) settlePendingDeletes(ctx context.Context, j *job.PurgeJob, prog
 		}
 	}
 
-	addDeleted(progress, reconciled)
-	setPendingDeletes(progress, channelID, retry)
-	e.saveProgress(ctx, progress)
+	e.commit(ctx, state, func() {
+		addDeleted(state.progress, ch, reconciled)
+		setPendingDeletes(ch, retry)
+	})
 
 	unresolved := 0
 	for _, id := range retry {
-		if e.isCancelled(j.ID) {
-			return unresolved, ErrCancelled
-		}
-		if ctx.Err() != nil {
-			e.saveProgress(ctx, progress)
-			return unresolved, ErrInterrupted
+		if reason := abortReason(ctx); reason != nil {
+			e.commit(ctx, state, nil)
+			return unresolved, reason
 		}
 
-		err := e.client.Rest.DeleteMessage(cid, id)
+		err := e.client.Rest.DeleteMessage(cid, id, rest.WithCtx(ctx))
 		switch {
 		case err == nil || rest.IsJSONErrorCode(err, rest.JSONErrorCodeUnknownMessage):
-			addDeleted(progress, 1)
-			e.saveProgress(ctx, progress)
+			e.commit(ctx, state, func() { addDeleted(state.progress, ch, 1) })
 		case deleteDeniedForChannel(err):
-			clearPendingDeletes(progress)
-			e.saveProgress(ctx, progress)
+			e.commit(ctx, state, func() { clearPendingDeletes(ch) })
 			return unresolved, fmt.Errorf("delete message: %w", err)
+		case ctx.Err() != nil:
+			e.commit(ctx, state, nil)
+			return unresolved, ErrInterrupted
 		default:
 			unresolved++
 			e.logger.Warn("delete pending message", zap.Uint64("channel", channelID), zap.Uint64("message", uint64(id)), zap.Error(err))
 		}
 	}
 
-	clearPendingDeletes(progress)
-	e.saveProgress(ctx, progress)
+	e.commit(ctx, state, func() { clearPendingDeletes(ch) })
 	return unresolved, nil
 }
 
 // Discord rejects a bulk delete as a whole, so a rejected batch is retried
 // message by message rather than lost. Returns how many still failed.
-func (e *Engine) deleteBatch(ctx context.Context, j *job.PurgeJob, progress *job.PurgeProgress, channelID uint64, batch []snowflake.ID) (int, error) {
+func (e *Engine) deleteBatch(ctx context.Context, state *execState, ch *job.PurgeChannelProgress, batch []snowflake.ID) (int, error) {
+	channelID := ch.ChannelID
 	cid := snowflake.ID(channelID)
-	setPendingDeletes(progress, channelID, batch)
-	e.saveProgress(ctx, progress)
+	e.commit(ctx, state, func() { setPendingDeletes(ch, batch) })
 
+	// ctx must never carry a deadline: disgo fails a request whose deadline falls
+	// before the bucket reset it is waiting for.
 	var err error
 	if len(batch) == 1 {
-		err = e.client.Rest.DeleteMessage(cid, batch[0])
+		err = e.client.Rest.DeleteMessage(cid, batch[0], rest.WithCtx(ctx))
 		if rest.IsJSONErrorCode(err, rest.JSONErrorCodeUnknownMessage) {
 			err = nil
 		}
 	} else {
-		err = e.client.Rest.BulkDeleteMessages(cid, batch)
+		err = e.client.Rest.BulkDeleteMessages(cid, batch, rest.WithCtx(ctx))
 	}
 
 	if err == nil {
-		addDeleted(progress, len(batch))
-		clearPendingDeletes(progress)
-		e.saveProgress(ctx, progress)
+		e.commit(ctx, state, func() {
+			addDeleted(state.progress, ch, len(batch))
+			clearPendingDeletes(ch)
+		})
 		return 0, nil
 	}
 	if deleteDeniedForChannel(err) {
-		clearPendingDeletes(progress)
-		e.saveProgress(ctx, progress)
+		e.commit(ctx, state, func() { clearPendingDeletes(ch) })
 		return 0, fmt.Errorf("delete messages: %w", err)
+	}
+
+	// Neither is one bad message in the batch, so splitting it up would only multiply
+	// the load Discord just refused.
+	if ctx.Err() != nil {
+		e.commit(ctx, state, nil)
+		return 0, ErrInterrupted
+	}
+	if ratelimit.IsTooManyRequests(err) {
+		e.commit(ctx, state, func() { clearPendingDeletes(ch) })
+		e.logger.Warn("bulk delete still rate limited after retries",
+			zap.Uint64("channel", channelID), zap.Int("count", len(batch)))
+		return len(batch), nil
 	}
 
 	e.logger.Warn("delete messages, retrying individually",
 		zap.Uint64("channel", channelID), zap.Int("count", len(batch)), zap.Error(err))
-	return e.settlePendingDeletes(ctx, j, progress)
+	return e.settlePendingDeletes(ctx, state, ch)
 }
 
 // Execute runs a purge job end-to-end.
@@ -567,74 +670,142 @@ func (e *Engine) Execute(ctx context.Context, j *job.PurgeJob) error {
 		e.saveProgress(ctx, progress)
 	}
 	state.progress = progress
+	// Both sources: on resume the stored IDs can predate the ones just resolved,
+	// and either would be the bot's own message.
+	state.exclude(
+		state.commandMessageID, state.fallbackMessageID,
+		snowflake.ID(progress.CommandMessageID), snowflake.ID(progress.FallbackMessageID),
+	)
 
 	if !statusJustCreated {
 		e.sendInProgress(ctx, j, state, target, locale.MsgPurgeStatusStarting.In(j.Locale), true)
 	}
 
-	for progress.CurrentIndex < len(progress.ChannelIDs) {
-		if e.isCancelled(j.ID) {
-			e.sendCancelled(ctx, j, state, progress.TotalDeleted, showBranding)
-			return ErrCancelled
+	pending := make([]*job.PurgeChannelProgress, 0, len(progress.Channels))
+	for i := range progress.Channels {
+		if !progress.Channels[i].Done {
+			pending = append(pending, &progress.Channels[i])
 		}
-		if ctx.Err() != nil {
-			e.saveProgress(ctx, progress)
-			return ErrInterrupted
-		}
+	}
 
-		channelID := progress.ChannelIDs[progress.CurrentIndex]
-		chanName := fmt.Sprintf("<#%d>", channelID)
-		e.sendInProgress(ctx, j, state, target, locale.MsgPurgeStatusFetching.In(j.Locale, chanName), true)
-		e.saveProgress(ctx, progress)
+	jobCtx, abort := context.WithCancelCause(ctx)
+	defer abort(nil)
 
-		err := e.purgeChannel(ctx, j, channelID, state, progress)
-		if errors.Is(err, ErrCancelled) {
-			e.sendCancelled(ctx, j, state, progress.TotalDeleted, showBranding)
-			return ErrCancelled
-		}
-		if errors.Is(err, ErrInterrupted) {
-			e.saveProgress(ctx, progress)
-			return ErrInterrupted
-		}
+	g, gctx := errgroup.WithContext(jobCtx)
+	g.SetLimit(min(max(e.cfg.ChannelConcurrency, 1), max(len(pending), 1)))
 
-		ch := currentChannelProgress(progress)
-		if ch != nil {
-			ch.Done = true
-			if err != nil {
-				ch.Error = err.Error()
+	var inFlight sync.Map
+	workers := new(sync.WaitGroup)
+	workers.Add(2)
+
+	go func() {
+		defer workers.Done()
+		ticker := time.NewTicker(cancelPollInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-gctx.Done():
+				return
+			case <-ticker.C:
+				if e.isCancelled(j.ID) {
+					abort(ErrCancelled)
+					return
+				}
 			}
 		}
-		if err != nil {
-			e.logger.Warn("channel purge failed", zap.Uint64("channel", channelID), zap.Error(err))
+	}()
+
+	// The status message is edited only from here, never from a channel goroutine.
+	go func() {
+		defer workers.Done()
+		ticker := time.NewTicker(statusRefreshInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-gctx.Done():
+				return
+			case <-ticker.C:
+				names := inFlightNames(progress.ChannelIDs, &inFlight)
+				if names == "" {
+					continue
+				}
+				e.sendInProgress(ctx, j, state, target, locale.MsgPurgeStatusFetching.In(j.Locale, names), true)
+			}
 		}
-		progress.BeforeID = 0
-		progress.CurrentIndex++
-		e.saveProgress(ctx, progress)
+	}()
+
+	for _, ch := range pending {
+		g.Go(func() error {
+			inFlight.Store(ch.ChannelID, true)
+			defer inFlight.Delete(ch.ChannelID)
+
+			err := e.purgeChannel(gctx, j, state, ch)
+			// Only these abort the job. A channel that simply failed is recorded and
+			// the rest carry on, exactly as when channels ran one at a time.
+			if errors.Is(err, ErrCancelled) || errors.Is(err, ErrInterrupted) {
+				return err
+			}
+			if err != nil {
+				e.logger.Warn("channel purge failed", zap.Uint64("channel", ch.ChannelID), zap.Error(err))
+			}
+			e.commit(ctx, state, func() {
+				ch.Done = true
+				if err != nil {
+					ch.Error = err.Error()
+				}
+			})
+			return nil
+		})
 	}
 
-	if e.isCancelled(j.ID) {
-		e.sendCancelled(ctx, j, state, progress.TotalDeleted, showBranding)
+	waitErr := g.Wait()
+	abort(nil)
+	workers.Wait()
+
+	if errors.Is(waitErr, ErrCancelled) {
+		e.sendCancelled(ctx, j, state, state.totalDeleted(), showBranding)
 		return ErrCancelled
 	}
-	if ctx.Err() != nil {
-		e.saveProgress(ctx, progress)
+	if waitErr != nil {
+		e.commit(ctx, state, nil)
 		return ErrInterrupted
 	}
 
+	if e.isCancelled(j.ID) {
+		e.sendCancelled(ctx, j, state, state.totalDeleted(), showBranding)
+		return ErrCancelled
+	}
+	if ctx.Err() != nil {
+		e.commit(ctx, state, nil)
+		return ErrInterrupted
+	}
+
+	totalDeleted := state.totalDeleted()
 	elapsed := time.Since(progress.StartedAt)
-	e.sendCompletion(ctx, j, state, target, progress.TotalDeleted, elapsed, channelResultsFromProgress(progress), showBranding)
+	e.sendCompletion(ctx, j, state, target, totalDeleted, elapsed, state.results(), showBranding)
 
 	if err := e.db.RecordPurgeEvent(ctx, database.RecordPurgeEventParams{
 		GuildID:    int64(j.GuildID),
 		PurgeType:  string(j.PurgeType),
 		TargetType: string(j.TargetType),
-		Deleted:    progress.TotalDeleted,
+		Deleted:    totalDeleted,
 		DurationMs: int(elapsed.Milliseconds()),
 	}); err != nil {
 		e.logger.Warn("record purge event", zap.Error(err))
 	}
 
 	return nil
+}
+
+// Resolve order, so the status message does not reorder as channels finish.
+func inFlightNames(order []uint64, inFlight *sync.Map) string {
+	names := make([]string, 0, len(order))
+	for _, id := range order {
+		if _, ok := inFlight.Load(id); ok {
+			names = append(names, fmt.Sprintf("<#%d>", id))
+		}
+	}
+	return strings.Join(names, ", ")
 }
 
 // resolveChannels returns the ordered list of channel (and thread) IDs to purge.
@@ -755,51 +926,87 @@ func (e *Engine) fetchThreadsForChannels(ctx context.Context, guildID uint64, pa
 	return threadIDs
 }
 
-// purgeChannel fetches and deletes matching messages from a single channel or thread.
-func (e *Engine) purgeChannel(ctx context.Context, j *job.PurgeJob, channelID uint64, state *execState, progress *job.PurgeProgress) error {
+// purgeChannel fetches and deletes matching messages from a single channel or
+// thread. ch is owned by this goroutine; every write to it goes through commit.
+func (e *Engine) purgeChannel(ctx context.Context, j *job.PurgeJob, state *execState, ch *job.PurgeChannelProgress) error {
+	channelID := ch.ChannelID
 	cid := snowflake.ID(channelID)
 	unresolved := 0
 
-	if dropStalePendingDeletes(progress, channelID) {
-		e.saveProgress(ctx, progress)
+	state.mu.Lock()
+	cutoff := state.progress.CutoffAt
+	state.mu.Unlock()
+
+	// Matches accumulate across fetch pages so a bulk delete carries a full batch
+	// rather than whatever matched in one page of 100. ch.BeforeID stays put until
+	// a flush, so an interrupted run re-scans those pages instead of skipping
+	// them; anything already deleted no longer comes back from GetMessages.
+	var buffered []snowflake.ID
+	scannedTo := ch.BeforeID
+	pagesSinceFlush := 0
+
+	flush := func() error {
+		fresh, aged := splitAgedOut(buffered)
+		buffered = fresh
+
+		failed, err := e.deleteEach(ctx, state, ch, aged)
+		unresolved += failed
+		if err != nil {
+			return err
+		}
+
+		for len(buffered) > 0 {
+			if reason := abortReason(ctx); reason != nil {
+				e.commit(ctx, state, nil)
+				return reason
+			}
+
+			var batch []snowflake.ID
+			batch, buffered = nextBatch(buffered)
+			failed, err := e.deleteBatch(ctx, state, ch, batch)
+			if err != nil {
+				return err
+			}
+			unresolved += failed
+		}
+		e.commit(ctx, state, func() { ch.BeforeID = scannedTo })
+		pagesSinceFlush = 0
+		return nil
 	}
 
 	for {
-		settled, err := e.settlePendingDeletes(ctx, j, progress)
+		settled, err := e.settlePendingDeletes(ctx, state, ch)
 		if err != nil {
 			return err
 		}
 		unresolved += settled
-		if e.isCancelled(j.ID) {
-			return ErrCancelled
-		}
-		if ctx.Err() != nil {
-			e.saveProgress(ctx, progress)
-			return ErrInterrupted
+		if reason := abortReason(ctx); reason != nil {
+			e.commit(ctx, state, nil)
+			return reason
 		}
 
-		beforeID := snowflake.ID(progress.BeforeID)
-		messages, err := e.client.Rest.GetMessages(cid, 0, beforeID, 0, fetchBatchSize)
+		messages, err := e.client.Rest.GetMessages(cid, 0, snowflake.ID(scannedTo), 0, fetchBatchSize, rest.WithCtx(ctx))
 		if err != nil {
+			// A failed channel is recorded and skipped, so shutdown must not look like one.
+			if reason := abortReason(ctx); reason != nil {
+				e.commit(ctx, state, nil)
+				return reason
+			}
 			return fmt.Errorf("fetch messages: %w", err)
 		}
 		if len(messages) == 0 {
 			break
 		}
 
-		var toDelete []snowflake.ID
 		var oldMessages []snowflake.ID
 		var atCutoff bool
 
 		for _, msg := range messages {
-			if !progress.CutoffAt.IsZero() && msg.CreatedAt.Before(progress.CutoffAt) {
+			if !cutoff.IsZero() && msg.CreatedAt.Before(cutoff) {
 				atCutoff = true
 				break
 			}
-			if state.commandMessageID != 0 && msg.ID == state.commandMessageID {
-				continue
-			}
-			if state.fallbackMessageID != 0 && msg.ID == state.fallbackMessageID {
+			if state.isExcluded(msg.ID) {
 				continue
 			}
 			if j.SkipUserID != 0 && msg.Author.ID == snowflake.ID(j.SkipUserID) {
@@ -816,58 +1023,34 @@ func (e *Engine) purgeChannel(ctx context.Context, j *job.PurgeJob, channelID ui
 				continue
 			}
 			if time.Since(msg.CreatedAt) < bulkDeleteMaxAge {
-				toDelete = append(toDelete, msg.ID)
+				buffered = append(buffered, msg.ID)
 			} else {
 				oldMessages = append(oldMessages, msg.ID)
 			}
 		}
 
-		nextBeforeID := progress.BeforeID
-		if len(messages) > 0 {
-			nextBeforeID = uint64(messages[len(messages)-1].ID)
+		scannedTo = uint64(messages[len(messages)-1].ID)
+		pagesSinceFlush++
+
+		failed, err := e.deleteEach(ctx, state, ch, oldMessages)
+		unresolved += failed
+		if err != nil {
+			return err
 		}
 
-		for len(toDelete) > 0 {
-			if e.isCancelled(j.ID) {
-				return ErrCancelled
-			}
-			if ctx.Err() != nil {
-				e.saveProgress(ctx, progress)
-				return ErrInterrupted
-			}
-
-			batch := toDelete
-			if len(batch) > 100 {
-				batch = toDelete[:100]
-			}
-			toDelete = toDelete[len(batch):]
-			failed, err := e.deleteBatch(ctx, j, progress, channelID, batch)
-			if err != nil {
+		if shouldFlush(len(buffered), pagesSinceFlush) {
+			if err := flush(); err != nil {
 				return err
 			}
-			unresolved += failed
 		}
-		for _, id := range oldMessages {
-			if e.isCancelled(j.ID) {
-				return ErrCancelled
-			}
-			if ctx.Err() != nil {
-				e.saveProgress(ctx, progress)
-				return ErrInterrupted
-			}
-			failed, err := e.deleteBatch(ctx, j, progress, channelID, []snowflake.ID{id})
-			if err != nil {
-				return err
-			}
-			unresolved += failed
-		}
-
-		progress.BeforeID = nextBeforeID
-		e.saveProgress(ctx, progress)
 
 		if atCutoff || len(messages) < fetchBatchSize {
 			break
 		}
+	}
+
+	if err := flush(); err != nil {
+		return err
 	}
 
 	if unresolved > 0 {

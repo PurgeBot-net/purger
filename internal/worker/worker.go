@@ -9,6 +9,7 @@ import (
 
 	"github.com/disgoorg/disgo"
 	"github.com/disgoorg/disgo/bot"
+	"github.com/disgoorg/disgo/rest"
 	"github.com/redis/go-redis/v9"
 	"go.uber.org/zap"
 
@@ -16,6 +17,7 @@ import (
 	"github.com/PurgeBot-net/database"
 	"github.com/PurgeBot-net/purger/config"
 	"github.com/PurgeBot-net/purger/internal/engine"
+	"github.com/PurgeBot-net/purger/internal/ratelimit"
 )
 
 type Worker struct {
@@ -27,7 +29,8 @@ type Worker struct {
 }
 
 func New(cfg config.Config, logger *zap.Logger, db *database.Database, redis *redis.Client) (*Worker, error) {
-	client, err := disgo.New(cfg.Token)
+	limiter := ratelimit.New(logger)
+	client, err := disgo.New(cfg.Token, bot.WithRestClientConfigOpts(rest.WithRateLimiter(limiter)))
 	if err != nil {
 		return nil, fmt.Errorf("create discord client: %w", err)
 	}

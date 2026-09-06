@@ -25,6 +25,8 @@ type Config struct {
 
 	// Worker
 	WorkerConcurrency int `env:"WORKER_CONCURRENCY" envDefault:"4"`
+	// Channels of one purge to run at once. Multiplies with WorkerConcurrency.
+	ChannelConcurrency int `env:"PURGE_CHANNEL_CONCURRENCY" envDefault:"3"`
 
 	// Observability
 	SentryDSN string `env:"SENTRY_DSN"`
