@@ -76,6 +76,17 @@ type execState struct {
 	membersMu sync.RWMutex
 	members   map[snowflake.ID]memberLookup
 
+	// lang is j.Locale, for the delete paths that do not carry the job.
+	lang string
+
+	// See permissions.go. Both caches expire after botPermsTTL.
+	botPermsMu sync.Mutex
+	botPermsAt time.Time
+	botPerms   botPermissions
+
+	parentMu         sync.RWMutex
+	parentOverwrites map[snowflake.ID]parentLookup
+
 	// excluded holds the bot's own status messages. Append-only: the UI can
 	// replace its message mid-run, and clearing the set would leave a window in
 	// which a channel goroutine deletes the replacement.
@@ -97,8 +108,10 @@ type execState struct {
 
 func newExecState(j *job.PurgeJob) (*execState, error) {
 	s := &execState{
-		members:  make(map[snowflake.ID]memberLookup),
-		excluded: make(map[snowflake.ID]bool),
+		lang:             j.Locale,
+		members:          make(map[snowflake.ID]memberLookup),
+		excluded:         make(map[snowflake.ID]bool),
+		parentOverwrites: make(map[snowflake.ID]parentLookup),
 	}
 	if j.FilterMode == job.FilterModeRegex && j.Filter != "" {
 		pattern := j.Filter
@@ -498,7 +511,8 @@ func (e *Engine) settlePendingDeletes(ctx context.Context, state *execState, ch 
 			e.commit(ctx, state, func() { addDeleted(state.progress, ch, 1) })
 		case deleteDeniedForChannel(err):
 			e.commit(ctx, state, func() { clearPendingDeletes(ch) })
-			return unresolved, fmt.Errorf("delete message: %w", err)
+			e.logger.Warn("delete denied", zap.Uint64("channel", channelID), zap.Error(err))
+			return unresolved, fmt.Errorf("%s", locale.MsgPurgeMissingPerms.In(state.lang, permissionNames(deniedPermission(err))))
 		default:
 			if reason := abortedDuring(ctx, err); reason != nil {
 				e.commit(ctx, state, nil)
@@ -541,7 +555,8 @@ func (e *Engine) deleteBatch(ctx context.Context, state *execState, ch *job.Purg
 	}
 	if deleteDeniedForChannel(err) {
 		e.commit(ctx, state, func() { clearPendingDeletes(ch) })
-		return 0, fmt.Errorf("delete messages: %w", err)
+		e.logger.Warn("delete denied", zap.Uint64("channel", channelID), zap.Error(err))
+		return 0, fmt.Errorf("%s", locale.MsgPurgeMissingPerms.In(state.lang, permissionNames(deniedPermission(err))))
 	}
 
 	// Neither is one bad message in the batch, so splitting it up would only multiply
@@ -968,6 +983,11 @@ func (e *Engine) purgeChannel(ctx context.Context, j *job.PurgeJob, state *execS
 	cid := snowflake.ID(channelID)
 	unresolved := 0
 
+	// Not at job start: a permission can be taken away between the gate and this channel's turn.
+	if missing := e.missingPermissionsForChannel(ctx, state, snowflake.ID(j.GuildID), cid); missing != 0 {
+		return fmt.Errorf("%s", locale.MsgPurgeMissingPerms.In(j.Locale, permissionNames(missing)))
+	}
+
 	state.mu.Lock()
 	cutoff := state.progress.CutoffAt
 	state.mu.Unlock()
@@ -1026,6 +1046,10 @@ func (e *Engine) purgeChannel(ctx context.Context, j *job.PurgeJob, state *execS
 			if reason := abortReason(ctx); reason != nil {
 				e.commit(ctx, state, nil)
 				return reason
+			}
+			if fetchDeniedForChannel(err) {
+				e.logger.Warn("fetch denied", zap.Uint64("channel", channelID), zap.Error(err))
+				return fmt.Errorf("%s", locale.MsgPurgeMissingPerms.In(j.Locale, permissionNames(deniedPermission(err))))
 			}
 			return fmt.Errorf("fetch messages: %w", err)
 		}
@@ -1328,17 +1352,7 @@ func (e *Engine) sendCompletion(ctx context.Context, j *job.PurgeJob, state *exe
 		texts = append(texts, discord.NewTextDisplay(locale.MsgPurgeCompleteChannelBreakdown.In(j.Locale, strings.Join(lines, "\n"))))
 	}
 
-	var skipped []channelResult
-	for _, r := range results {
-		if r.err != nil {
-			skipped = append(skipped, r)
-		}
-	}
-	if len(skipped) > 0 {
-		lines := make([]string, len(skipped))
-		for i, r := range skipped {
-			lines[i] = locale.MsgPurgeCompleteSkippedLine.In(j.Locale, r.name, r.err.Error())
-		}
+	if lines := skippedChannelLines(results, j.Locale); len(lines) > 0 {
 		texts = append(texts, discord.NewTextDisplay(locale.MsgPurgeCompleteSkippedChannels.In(j.Locale, strings.Join(lines, "\n"))))
 	}
 
