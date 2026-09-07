@@ -10,6 +10,7 @@ import (
 
 	"github.com/disgoorg/disgo"
 	"github.com/disgoorg/disgo/bot"
+	"github.com/disgoorg/disgo/cache"
 	"github.com/disgoorg/disgo/rest"
 	"github.com/redis/go-redis/v9"
 	"go.uber.org/zap"
@@ -32,7 +33,11 @@ type Worker struct {
 
 func New(cfg config.Config, logger *zap.Logger, db *database.Database, redis *redis.Client) (*Worker, error) {
 	limiter := ratelimit.New(logger)
-	client, err := disgo.New(cfg.Token, bot.WithRestClientConfigOpts(rest.WithRateLimiter(limiter)))
+	// disgo's default; stated so it cannot silently change.
+	client, err := disgo.New(cfg.Token,
+		bot.WithCacheConfigOpts(cache.WithCaches(cache.FlagsNone)),
+		bot.WithRestClientConfigOpts(rest.WithRateLimiter(limiter)),
+	)
 	if err != nil {
 		return nil, fmt.Errorf("create discord client: %w", err)
 	}
