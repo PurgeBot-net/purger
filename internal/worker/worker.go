@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -44,6 +45,11 @@ func New(cfg config.Config, logger *zap.Logger, db *database.Database, redis *re
 	return &Worker{cfg: cfg, logger: logger, db: db, redis: redis, client: client}, nil
 }
 
+// Snowflakes exceed 2^53, so a JSON reader using float64 corrupts them as numbers.
+func idField(key string, id uint64) zap.Field {
+	return zap.String(key, strconv.FormatUint(id, 10))
+}
+
 // Run blocks, spawning WorkerConcurrency goroutines that consume purge jobs
 // from Redis concurrently. Returns when ctx is cancelled and all goroutines exit.
 func (w *Worker) Run(ctx context.Context) {
@@ -53,23 +59,25 @@ func (w *Worker) Run(ctx context.Context) {
 	if concurrency < 1 {
 		concurrency = 1
 	}
-	w.logger.Info("purge worker started", zap.Int("concurrency", concurrency))
+	w.logger.Info("purge worker started",
+		zap.Int("concurrency", concurrency),
+		zap.Int("channel_concurrency", w.cfg.ChannelConcurrency),
+	)
 
-	eng := engine.New(w.cfg, w.logger, w.db, w.redis, w.client)
 	var wg sync.WaitGroup
 	for range concurrency {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			w.loop(ctx, eng)
+			w.loop(ctx)
 		}()
 	}
 	wg.Wait()
-	w.logger.Info("purge worker stopped")
+	w.logger.Info("purge worker stopped", zap.Int64("running", w.running.Load()))
 }
 
 // loop is the per-goroutine dequeue-and-execute cycle.
-func (w *Worker) loop(ctx context.Context, eng *engine.Engine) {
+func (w *Worker) loop(ctx context.Context) {
 	for {
 		select {
 		case <-ctx.Done():
@@ -88,25 +96,37 @@ func (w *Worker) loop(ctx context.Context, eng *engine.Engine) {
 		if j == nil {
 			continue // timeout, loop again
 		}
-		jobLog := w.logger.With(zap.String("id", j.ID), zap.Uint64("guild_id", j.GuildID))
+		jobLog := w.logger.With(zap.String("job_id", j.ID), idField("guild_id", j.GuildID))
 
 		// Guard against double-enqueue: skip if this is a stale copy of a recovered job.
 		active, err := job.GetActiveJob(ctx, w.redis, j.GuildID)
 		if err != nil {
-			jobLog.Error("verify active job", zap.Error(err))
+			jobLog.Error("verify active job, dropping until restart recovery", zap.Error(err))
 			continue
 		}
-		if active == nil || active.ID != j.ID {
-			jobLog.Info("skipping stale recovered job")
+		if active == nil {
+			jobLog.Info("skipping stale recovered job", zap.String("reason", "guild has no active job"))
+			continue
+		}
+		if active.ID != j.ID {
+			jobLog.Info("skipping stale recovered job",
+				zap.String("reason", "superseded"),
+				zap.String("active_job_id", active.ID),
+			)
 			continue
 		}
 
 		running := w.running.Add(1)
 		jobLog.Info("processing purge job",
-			zap.String("type", string(j.PurgeType)),
+			zap.String("purge_type", string(j.PurgeType)),
+			zap.String("target_type", string(j.TargetType)),
+			idField("target_id", j.TargetID),
+			idField("requested_by_id", j.RequestedByID),
+			zap.Duration("queue_wait", time.Since(j.CreatedAt)),
 			zap.Int64("running", running),
 		)
 
+		eng := engine.New(w.cfg, jobLog, w.db, w.redis, w.client)
 		err = eng.Execute(ctx, j)
 		// Not deferred: extracting a function to reach one would drag the cleanup
 		// below into the interrupt path, which must skip it.
@@ -138,14 +158,19 @@ func (w *Worker) recoverActiveJobs(ctx context.Context) {
 		w.logger.Error("scan active jobs for recovery", zap.Error(err))
 		return
 	}
+	w.logger.Info("scanned active jobs for recovery", zap.Int("jobs", len(jobs)))
 	for _, j := range jobs {
+		jobLog := w.logger.With(zap.String("job_id", j.ID), idField("guild_id", j.GuildID))
 		if err := job.RemoveQueued(ctx, w.redis, j); err != nil {
-			w.logger.Warn("remove stale queued recovered job", zap.String("id", j.ID), zap.Uint64("guild_id", j.GuildID), zap.Error(err))
+			jobLog.Warn("remove stale queued recovered job, duplicate queue entry expected", zap.Error(err))
 		}
 		if err := job.Enqueue(ctx, w.redis, j); err != nil {
-			w.logger.Error("re-enqueue recovered job", zap.String("id", j.ID), zap.Uint64("guild_id", j.GuildID), zap.Error(err))
+			jobLog.Error("re-enqueue recovered job", zap.Error(err))
 		} else {
-			w.logger.Info("recovered active job", zap.String("id", j.ID), zap.Uint64("guild_id", j.GuildID))
+			jobLog.Info("recovered active job",
+				zap.String("purge_type", string(j.PurgeType)),
+				zap.Duration("age", time.Since(j.CreatedAt)),
+			)
 		}
 	}
 }

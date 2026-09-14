@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -47,8 +48,14 @@ type Engine struct {
 	client *bot.Client
 }
 
+// logger already carries job_id and guild_id: worker.go builds one Engine per job.
 func New(cfg config.Config, logger *zap.Logger, db *database.Database, redis *redis.Client, client *bot.Client) *Engine {
 	return &Engine{cfg: cfg, logger: logger, db: db, redis: redis, client: client}
+}
+
+// Snowflakes exceed 2^53, so a JSON reader using float64 corrupts them as numbers.
+func idField(key string, id uint64) zap.Field {
+	return zap.String(key, strconv.FormatUint(id, 10))
 }
 
 // A failed lookup must stay distinguishable from a confirmed absence, because
@@ -145,7 +152,8 @@ func (s *execState) lookupMember(ctx context.Context, e *Engine, guildID, userID
 	member, err := e.client.Rest.GetMember(guildID, userID)
 	if err != nil {
 		if !memberLookupSaysAbsent(err) {
-			e.logger.Warn("look up guild member", zap.Uint64("user", uint64(userID)), zap.Error(err))
+			// Unknown counts as "no match", so an inactive purge keeps the message.
+			e.logger.Warn("look up guild member", idField("user_id", uint64(userID)), zap.Error(err))
 			return nil, memberStatusUnknown
 		}
 		s.storeMember(userID, memberLookup{status: memberStatusAbsent})
@@ -198,7 +206,9 @@ type channelResult struct {
 // Matched by channel ID, not position, so entries that drifted out of order cannot
 // credit deletions to the wrong channel. Call once, before any goroutine takes a
 // pointer into Channels.
-func ensureChannelProgress(p *job.PurgeProgress) {
+// Returns how many stored entries were dropped for not being in ChannelIDs, losing
+// their Deleted count and orphaning their PendingDeleteIDs.
+func ensureChannelProgress(p *job.PurgeProgress) int {
 	stored := make(map[uint64]job.PurgeChannelProgress, len(p.Channels))
 	for _, ch := range p.Channels {
 		if ch.ChannelID != 0 {
@@ -209,11 +219,13 @@ func ensureChannelProgress(p *job.PurgeProgress) {
 	for i, id := range p.ChannelIDs {
 		if existing, ok := stored[id]; ok {
 			channels[i] = existing
+			delete(stored, id)
 			continue
 		}
 		channels[i] = job.PurgeChannelProgress{ChannelID: id}
 	}
 	p.Channels = channels
+	return len(stored)
 }
 
 func channelResultsFromProgress(p *job.PurgeProgress) []channelResult {
@@ -234,12 +246,18 @@ func channelResultsFromProgress(p *job.PurgeProgress) []channelResult {
 func (e *Engine) saveProgress(ctx context.Context, p *job.PurgeProgress) {
 	saveCtx := ctx
 	var cancel context.CancelFunc
-	if ctx.Err() != nil {
+	detached := ctx.Err() != nil
+	if detached {
 		saveCtx, cancel = context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 	}
 	if err := job.SaveProgress(saveCtx, e.redis, p); err != nil {
-		e.logger.Warn("save purge progress", zap.String("id", p.JobID), zap.Error(err))
+		// A detached save is the shutdown checkpoint; losing that one costs real work.
+		e.logger.Warn("save purge progress",
+			zap.Int("total_deleted", p.TotalDeleted),
+			zap.Bool("detached", detached),
+			zap.Error(err),
+		)
 	}
 }
 
@@ -271,7 +289,8 @@ func (e *Engine) createStatusMessage(ctx context.Context, j *job.PurgeJob, compo
 		discord.NewMessageCreateV2(components...),
 	)
 	if err != nil {
-		e.logger.Warn("create channel status message", zap.Error(err))
+		e.logger.Warn("create channel status message",
+			idField("interaction_channel_id", j.InteractionChannelID), zap.Error(err))
 		return 0, 0, false
 	}
 	channelID := msg.ChannelID
@@ -308,7 +327,11 @@ func (e *Engine) dismissStaleInteractionMessage(j *job.PurgeJob, state *execStat
 		return
 	}
 	if err := e.client.Rest.DeleteMessage(channelID, state.commandMessageID); err != nil {
-		e.logger.Warn("delete stale interaction status message", zap.Error(err))
+		e.logger.Warn("delete stale interaction status message",
+			idField("channel_id", uint64(channelID)),
+			idField("message_id", uint64(state.commandMessageID)),
+			zap.Error(err),
+		)
 	}
 }
 
@@ -355,7 +378,7 @@ func (e *Engine) isCancelled(jobID string) bool {
 
 	cancelled, err := job.IsCancelled(ctx, e.redis, jobID)
 	if err != nil {
-		e.logger.Warn("check purge cancellation", zap.String("id", jobID), zap.Error(err))
+		e.logger.Warn("check purge cancellation", zap.Error(err))
 	}
 	return cancelled
 }
@@ -488,7 +511,12 @@ func (e *Engine) settlePendingDeletes(ctx context.Context, state *execState, ch 
 			e.commit(ctx, state, nil)
 			return 0, reason
 		} else {
-			e.logger.Warn("check pending deleted message", zap.Uint64("channel", channelID), zap.Uint64("message", rawID), zap.Error(err))
+			e.logger.Warn("check pending deleted message",
+				idField("channel_id", channelID),
+				idField("message_id", rawID),
+				zap.Int("pending", len(ch.PendingDeleteIDs)),
+				zap.Error(err),
+			)
 			retry = append(retry, id)
 		}
 	}
@@ -511,7 +539,12 @@ func (e *Engine) settlePendingDeletes(ctx context.Context, state *execState, ch 
 			e.commit(ctx, state, func() { addDeleted(state.progress, ch, 1) })
 		case deleteDeniedForChannel(err):
 			e.commit(ctx, state, func() { clearPendingDeletes(ch) })
-			e.logger.Warn("delete denied", zap.Uint64("channel", channelID), zap.Error(err))
+			e.logger.Warn("pending delete denied",
+				idField("channel_id", channelID),
+				idField("message_id", uint64(id)),
+				zap.String("missing_permissions", permissionNames(deniedPermission(err))),
+				zap.Error(err),
+			)
 			return unresolved, fmt.Errorf("%s", locale.MsgPurgeMissingPerms.In(state.lang, permissionNames(deniedPermission(err))))
 		default:
 			if reason := abortedDuring(ctx, err); reason != nil {
@@ -519,7 +552,11 @@ func (e *Engine) settlePendingDeletes(ctx context.Context, state *execState, ch 
 				return unresolved, reason
 			}
 			unresolved++
-			e.logger.Warn("delete pending message", zap.Uint64("channel", channelID), zap.Uint64("message", uint64(id)), zap.Error(err))
+			e.logger.Warn("delete pending message",
+				idField("channel_id", channelID),
+				idField("message_id", uint64(id)),
+				zap.Error(err),
+			)
 		}
 	}
 
@@ -555,7 +592,12 @@ func (e *Engine) deleteBatch(ctx context.Context, state *execState, ch *job.Purg
 	}
 	if deleteDeniedForChannel(err) {
 		e.commit(ctx, state, func() { clearPendingDeletes(ch) })
-		e.logger.Warn("delete denied", zap.Uint64("channel", channelID), zap.Error(err))
+		e.logger.Warn("batch delete denied",
+			idField("channel_id", channelID),
+			zap.Int("batch", len(batch)),
+			zap.String("missing_permissions", permissionNames(deniedPermission(err))),
+			zap.Error(err),
+		)
 		return 0, fmt.Errorf("%s", locale.MsgPurgeMissingPerms.In(state.lang, permissionNames(deniedPermission(err))))
 	}
 
@@ -568,12 +610,12 @@ func (e *Engine) deleteBatch(ctx context.Context, state *execState, ch *job.Purg
 	if ratelimit.IsTooManyRequests(err) {
 		e.commit(ctx, state, func() { clearPendingDeletes(ch) })
 		e.logger.Warn("bulk delete still rate limited after retries",
-			zap.Uint64("channel", channelID), zap.Int("count", len(batch)))
+			idField("channel_id", channelID), zap.Int("batch", len(batch)), zap.Error(err))
 		return len(batch), nil
 	}
 
 	e.logger.Warn("delete messages, retrying individually",
-		zap.Uint64("channel", channelID), zap.Int("count", len(batch)), zap.Error(err))
+		idField("channel_id", channelID), zap.Int("batch", len(batch)), zap.Error(err))
 	return e.settlePendingDeletes(ctx, state, ch)
 }
 
@@ -597,7 +639,9 @@ func (e *Engine) Execute(ctx context.Context, j *job.PurgeJob) error {
 	}
 
 	showBranding := true
-	if c, err := e.db.GetCustomization(ctx, int64(j.GuildID)); err == nil && c != nil {
+	if c, err := e.db.GetCustomization(ctx, int64(j.GuildID)); err != nil {
+		e.logger.Warn("look up guild customization, defaulting to branded output", zap.Error(err))
+	} else if c != nil {
 		showBranding = !c.RemoveBranding
 	}
 
@@ -624,8 +668,16 @@ func (e *Engine) Execute(ctx context.Context, j *job.PurgeJob) error {
 					statusJustCreated = true
 				}
 			}
-		} else if j.InteractionChannelID != 0 {
-			e.logger.Info("interaction response unavailable, creating channel status message", zap.Error(err))
+		} else if j.InteractionChannelID == 0 {
+			// The purge still runs, but nothing can report it back to the user.
+			e.logger.Warn("interaction response unavailable and no channel to fall back to",
+				idField("application_id", j.ApplicationID), zap.Error(err))
+		} else {
+			e.logger.Info("interaction response unavailable, creating channel status message",
+				idField("interaction_channel_id", j.InteractionChannelID),
+				idField("application_id", j.ApplicationID),
+				zap.Error(err),
+			)
 			startContainer := discord.NewContainer(
 				discord.NewTextDisplay(locale.MsgPurgeInProgress.In(j.Locale, target)),
 				discord.NewTextDisplay(locale.MsgPurgeStatusLabel.In(j.Locale, locale.MsgPurgeStatusStarting.In(j.Locale))),
@@ -637,8 +689,19 @@ func (e *Engine) Execute(ctx context.Context, j *job.PurgeJob) error {
 			}
 		}
 	} else if fallbackChanID != 0 && fallbackMsgID != 0 {
-		if msg, err := e.client.Rest.GetMessage(fallbackChanID, fallbackMsgID); err == nil && interactionResponseStillLoading(msg) {
-			e.logger.Info("restored status message still loading, re-acknowledging via interaction webhook")
+		msg, err := e.client.Rest.GetMessage(fallbackChanID, fallbackMsgID)
+		if err != nil {
+			e.logger.Warn("fetch restored status message",
+				idField("channel_id", uint64(fallbackChanID)),
+				idField("message_id", uint64(fallbackMsgID)),
+				zap.Error(err),
+			)
+		} else if interactionResponseStillLoading(msg) {
+			e.logger.Info("restored status message still loading, re-acknowledging via interaction webhook",
+				idField("channel_id", uint64(fallbackChanID)),
+				idField("message_id", uint64(fallbackMsgID)),
+				idField("command_message_id", progress.CommandMessageID),
+			)
 			commandMsgID = snowflake.ID(progress.CommandMessageID)
 			fallbackChanID = 0
 			fallbackMsgID = 0
@@ -651,7 +714,7 @@ func (e *Engine) Execute(ctx context.Context, j *job.PurgeJob) error {
 	if err != nil {
 		errState := &execState{fallbackChannelID: fallbackChanID, fallbackMessageID: fallbackMsgID}
 		e.updateText(ctx, j, errState, fmt.Sprintf("❌ %s", err.Error()))
-		return err
+		return fmt.Errorf("compile filter: %w", err)
 	}
 	state.commandMessageID = commandMsgID
 	state.fallbackChannelID = fallbackChanID
@@ -663,7 +726,7 @@ func (e *Engine) Execute(ctx context.Context, j *job.PurgeJob) error {
 		channels, err := e.resolveChannels(ctx, j)
 		if err != nil {
 			e.updateText(ctx, j, state, locale.MsgPurgeResolveError.In(j.Locale, err.Error()))
-			return err
+			return fmt.Errorf("resolve channels: %w", err)
 		}
 		cutoff := time.Time{}
 		if j.Days > 0 {
@@ -697,7 +760,10 @@ func (e *Engine) Execute(ctx context.Context, j *job.PurgeJob) error {
 		if fallbackMsgID != 0 {
 			progress.FallbackMessageID = uint64(fallbackMsgID)
 		}
-		ensureChannelProgress(progress)
+		if dropped := ensureChannelProgress(progress); dropped > 0 {
+			e.logger.Warn("discarded stored channel progress not in the resolved channel list",
+				zap.Int("dropped", dropped), zap.Int("channels", len(progress.ChannelIDs)))
+		}
 		e.saveProgress(ctx, progress)
 	}
 	state.progress = progress
@@ -706,6 +772,33 @@ func (e *Engine) Execute(ctx context.Context, j *job.PurgeJob) error {
 	state.exclude(
 		state.commandMessageID, state.fallbackMessageID,
 		snowflake.ID(progress.CommandMessageID), snowflake.ID(progress.FallbackMessageID),
+	)
+
+	// Fields are enumerated, never dumped: j carries InteractionToken. Filter is user
+	// text, so only its length goes in.
+	e.logger.Info("purge job started",
+		zap.String("purge_type", string(j.PurgeType)),
+		zap.String("target_type", string(j.TargetType)),
+		idField("target_id", j.TargetID),
+		idField("requested_by_id", j.RequestedByID),
+		zap.Int("channels", len(progress.ChannelIDs)),
+		zap.Bool("resumed", resumed),
+		zap.Int("already_deleted", progress.TotalDeleted),
+		zap.Int("days", j.Days),
+		zap.Time("cutoff", progress.CutoffAt),
+		zap.String("filter_mode", string(j.FilterMode)),
+		zap.Int("filter_len", len(j.Filter)),
+		zap.Bool("filter_keep", j.FilterKeep),
+		zap.Bool("case_sensitive", j.CaseSensitive),
+		zap.Bool("include_threads", j.IncludeThreads),
+		zap.Bool("include_bots", j.IncludeBots),
+		idField("filter_user_id", j.FilterUserID),
+		idField("filter_role_id", j.FilterRoleID),
+		idField("skip_user_id", j.SkipUserID),
+		zap.Int("skip_channels", len(j.SkipChannelIDs)),
+		zap.Int("skip_messages", len(j.SkipMessageIDs)),
+		zap.String("locale", j.Locale),
+		zap.Duration("queue_wait", start.Sub(j.CreatedAt)),
 	)
 
 	if !statusJustCreated {
@@ -739,6 +832,10 @@ func (e *Engine) Execute(ctx context.Context, j *job.PurgeJob) error {
 				return
 			case <-ticker.C:
 				if e.isCancelled(j.ID) {
+					e.logger.Info("purge cancellation observed",
+						zap.Duration("after", time.Since(start)),
+						zap.Int("deleted", state.totalDeleted()),
+					)
 					abort(ErrCancelled)
 					return
 				}
@@ -777,7 +874,12 @@ func (e *Engine) Execute(ctx context.Context, j *job.PurgeJob) error {
 				return err
 			}
 			if err != nil {
-				e.logger.Warn("channel purge failed", zap.Uint64("channel", ch.ChannelID), zap.Error(err))
+				e.logger.Warn("channel purge failed",
+					idField("channel_id", ch.ChannelID),
+					zap.Int("deleted", ch.Deleted),
+					idField("scanned_to", ch.BeforeID),
+					zap.Error(err),
+				)
 			}
 			e.commit(ctx, state, func() {
 				ch.Done = true
@@ -795,44 +897,33 @@ func (e *Engine) Execute(ctx context.Context, j *job.PurgeJob) error {
 
 	if errors.Is(waitErr, ErrCancelled) {
 		e.sendCancelled(ctx, j, state, state.totalDeleted(), showBranding)
+		e.logOutcome("cancelled", j, state, start, resumed)
 		return ErrCancelled
 	}
 	if waitErr != nil {
 		e.commit(ctx, state, nil)
+		e.logOutcome("interrupted", j, state, start, resumed, zap.Error(waitErr))
 		return ErrInterrupted
 	}
 
 	if e.isCancelled(j.ID) {
 		e.sendCancelled(ctx, j, state, state.totalDeleted(), showBranding)
+		e.logOutcome("cancelled", j, state, start, resumed)
 		return ErrCancelled
 	}
 	if ctx.Err() != nil {
 		e.commit(ctx, state, nil)
+		e.logOutcome("interrupted", j, state, start, resumed)
 		return ErrInterrupted
 	}
 
 	totalDeleted := state.totalDeleted()
 	elapsed := time.Since(progress.StartedAt)
 	results := state.results()
-	failed := 0
-	for _, r := range results {
-		if r.err != nil {
-			failed++
-		}
-	}
-
-	// deleted is cumulative across attempts, duration is only this run.
-	e.logger.Info("purge job completed",
-		zap.String("id", j.ID),
-		zap.Uint64("guild_id", j.GuildID),
-		zap.Int("deleted", totalDeleted),
-		zap.Int("channels", len(results)),
-		zap.Int("failed", failed),
-		zap.Bool("resumed", resumed),
-		zap.Duration("duration", time.Since(start)),
-	)
 
 	e.sendCompletion(ctx, j, state, target, totalDeleted, elapsed, results, showBranding)
+	// After delivery, so it cannot report success for a summary the user never saw.
+	e.logOutcome("completed", j, state, start, resumed)
 
 	if err := e.db.RecordPurgeEvent(ctx, database.RecordPurgeEventParams{
 		GuildID:    int64(j.GuildID),
@@ -841,10 +932,40 @@ func (e *Engine) Execute(ctx context.Context, j *job.PurgeJob) error {
 		Deleted:    totalDeleted,
 		DurationMs: int(elapsed.Milliseconds()),
 	}); err != nil {
-		e.logger.Warn("record purge event", zap.Error(err))
+		e.logger.Error("record purge event",
+			zap.String("purge_type", string(j.PurgeType)),
+			zap.String("target_type", string(j.TargetType)),
+			zap.Int("deleted", totalDeleted),
+			zap.Int64("duration_ms", elapsed.Milliseconds()),
+			zap.Error(err),
+		)
 	}
 
 	return nil
+}
+
+// One shape for every exit, so one query returns every job. deleted is cumulative
+// across attempts; total_duration is what RecordPurgeEvent stores as DurationMs.
+func (e *Engine) logOutcome(outcome string, j *job.PurgeJob, state *execState, start time.Time, resumed bool, extra ...zap.Field) {
+	results := state.results()
+	failed := 0
+	for _, r := range results {
+		if r.err != nil {
+			failed++
+		}
+	}
+	fields := append([]zap.Field{
+		zap.String("outcome", outcome),
+		zap.String("purge_type", string(j.PurgeType)),
+		zap.String("target_type", string(j.TargetType)),
+		zap.Int("deleted", state.totalDeleted()),
+		zap.Int("channels", len(results)),
+		zap.Int("failed", failed),
+		zap.Bool("resumed", resumed),
+		zap.Duration("run_duration", time.Since(start)),
+		zap.Duration("total_duration", time.Since(state.progress.StartedAt)),
+	}, extra...)
+	e.logger.Info("purge job finished", fields...)
 }
 
 // Resolve order, so the status message does not reorder as channels finish.
@@ -956,7 +1077,7 @@ func (e *Engine) fetchThreadsForChannels(ctx context.Context, guildID uint64, pa
 			}
 		}
 	} else {
-		e.logger.Warn("fetch active guild threads", zap.Error(err))
+		e.logger.Warn("fetch active guild threads", zap.Int("parents", len(parentIDs)), zap.Error(err))
 	}
 
 	for _, chanID := range parentIDs {
@@ -965,11 +1086,15 @@ func (e *Engine) fetchThreadsForChannels(ctx context.Context, guildID uint64, pa
 			for _, t := range pub.Threads {
 				threadIDs = append(threadIDs, uint64(t.ID()))
 			}
+		} else {
+			e.logger.Warn("fetch public archived threads", idField("channel_id", chanID), zap.Error(err))
 		}
 		if priv, err := e.client.Rest.GetPrivateArchivedThreads(cid, time.Time{}, 0); err == nil {
 			for _, t := range priv.Threads {
 				threadIDs = append(threadIDs, uint64(t.ID()))
 			}
+		} else {
+			e.logger.Warn("fetch private archived threads", idField("channel_id", chanID), zap.Error(err))
 		}
 	}
 
@@ -985,6 +1110,10 @@ func (e *Engine) purgeChannel(ctx context.Context, j *job.PurgeJob, state *execS
 
 	// Not at job start: a permission can be taken away between the gate and this channel's turn.
 	if missing := e.missingPermissionsForChannel(ctx, state, snowflake.ID(j.GuildID), cid); missing != 0 {
+		e.logger.Warn("channel skipped, missing permissions",
+			idField("channel_id", channelID),
+			zap.String("missing_permissions", permissionNames(missing)),
+		)
 		return fmt.Errorf("%s", locale.MsgPurgeMissingPerms.In(j.Locale, permissionNames(missing)))
 	}
 
@@ -1048,10 +1177,14 @@ func (e *Engine) purgeChannel(ctx context.Context, j *job.PurgeJob, state *execS
 				return reason
 			}
 			if fetchDeniedForChannel(err) {
-				e.logger.Warn("fetch denied", zap.Uint64("channel", channelID), zap.Error(err))
+				e.logger.Warn("fetch denied",
+					idField("channel_id", channelID),
+					zap.String("missing_permissions", permissionNames(deniedPermission(err))),
+					zap.Error(err),
+				)
 				return fmt.Errorf("%s", locale.MsgPurgeMissingPerms.In(j.Locale, permissionNames(deniedPermission(err))))
 			}
-			return fmt.Errorf("fetch messages: %w", err)
+			return fmt.Errorf("fetch messages from %d after %d: %w", channelID, scannedTo, err)
 		}
 		if len(messages) == 0 {
 			break
@@ -1113,6 +1246,11 @@ func (e *Engine) purgeChannel(ctx context.Context, j *job.PurgeJob, state *execS
 	}
 
 	if unresolved > 0 {
+		e.logger.Warn("channel finished with undeleted messages",
+			idField("channel_id", channelID),
+			zap.Int("unresolved", unresolved),
+			zap.Int("deleted", ch.Deleted),
+		)
 		return fmt.Errorf("%d message(s) could not be deleted", unresolved)
 	}
 	return nil
@@ -1359,14 +1497,18 @@ func (e *Engine) sendCompletion(ctx context.Context, j *job.PurgeJob, state *exe
 	if showBranding {
 		texts = append(texts, discord.NewTextDisplay("-# Powered by PurgeBot"))
 	}
-	e.updateComponents(ctx, j, state, discord.NewContainer(texts...))
+	if err := e.updateComponents(ctx, j, state, discord.NewContainer(texts...)); err != nil {
+		e.logger.Error("deliver purge completion message",
+			zap.Int("deleted", totalDeleted), zap.Error(err))
+	}
 }
 
 func (e *Engine) updateText(ctx context.Context, j *job.PurgeJob, state *execState, text string) {
 	e.updateComponents(ctx, j, state, discord.NewContainer(discord.NewTextDisplay(text)))
 }
 
-func (e *Engine) updateComponents(ctx context.Context, j *job.PurgeJob, state *execState, components ...discord.LayoutComponent) {
+// The error is returned for the completion message, the one edit with no later retry.
+func (e *Engine) updateComponents(ctx context.Context, j *job.PurgeJob, state *execState, components ...discord.LayoutComponent) error {
 	if state.fallbackChannelID != 0 && state.fallbackMessageID != 0 {
 		_, err := e.client.Rest.UpdateMessage(
 			state.fallbackChannelID,
@@ -1374,17 +1516,23 @@ func (e *Engine) updateComponents(ctx context.Context, j *job.PurgeJob, state *e
 			discord.NewMessageUpdateV2(components...),
 		)
 		if err != nil {
+			target := []zap.Field{
+				zap.String("delivery", "channel_message"),
+				idField("channel_id", uint64(state.fallbackChannelID)),
+				idField("message_id", uint64(state.fallbackMessageID)),
+			}
 			if shouldReplaceStatusMessageAfterUpdateError(err) {
-				e.logger.Info("status message disappeared, creating replacement", zap.Error(err))
+				e.logger.Info("status message disappeared, creating replacement", append(target, zap.Error(err))...)
 				e.clearStatusTarget(ctx, state)
 				if channelID, messageID, ok := e.createStatusMessage(ctx, j, components...); ok {
 					e.setStatusTarget(ctx, state, channelID, messageID)
-					return
+					return nil
 				}
 			}
-			e.logger.Warn("update status message", zap.Error(err))
+			e.logger.Warn("update status message", append(target, zap.Error(err))...)
+			return err
 		}
-		return
+		return nil
 	}
 
 	// The first edit after a deferred response must go through the interaction
@@ -1395,16 +1543,22 @@ func (e *Engine) updateComponents(ctx context.Context, j *job.PurgeJob, state *e
 		discord.NewMessageUpdateV2(components...),
 	)
 	if err != nil {
+		target := []zap.Field{
+			zap.String("delivery", "interaction_webhook"),
+			idField("application_id", j.ApplicationID),
+			idField("command_message_id", uint64(state.commandMessageID)),
+		}
 		if shouldCreateStatusMessageAfterInteractionError(err) {
-			e.logger.Info("interaction token expired, switching to channel status message", zap.Error(err))
+			e.logger.Info("interaction token expired, switching to channel status message", append(target, zap.Error(err))...)
 			if channelID, messageID, ok := e.createStatusMessage(ctx, j, components...); ok {
 				e.dismissStaleInteractionMessage(j, state, messageID)
 				e.setStatusTarget(ctx, state, channelID, messageID)
-				return
+				return nil
 			}
 		}
-		e.logger.Warn("update interaction", zap.Error(err))
-		return
+		e.logger.Warn("update interaction", append(target, zap.Error(err))...)
+		return err
 	}
 	e.adoptInteractionResponseTarget(ctx, j, state)
+	return nil
 }

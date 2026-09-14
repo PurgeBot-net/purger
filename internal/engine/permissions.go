@@ -53,10 +53,11 @@ func (s *execState) botPermissions(ctx context.Context, e *Engine, guildID snowf
 
 	s.botPermsAt = time.Now()
 	if rolesErr != nil || memberErr != nil || member == nil {
-		e.logger.Warn("look up bot permissions",
-			zap.Uint64("guild", uint64(guildID)),
+		// Cached for botPermsTTL, so this disables the permission guard for a full minute.
+		e.logger.Warn("look up bot permissions, permission guard disabled",
 			zap.NamedError("roles", rolesErr),
-			zap.NamedError("member", memberErr))
+			zap.NamedError("member", memberErr),
+			zap.Bool("member_absent", member == nil && memberErr == nil))
 		s.botPerms = botPermissions{}
 		return s.botPerms
 	}
@@ -83,6 +84,10 @@ func (s *execState) channelOverwrites(ctx context.Context, e *Engine, channelID 
 		if gc, isGuild := ch.(discord.GuildChannel); isGuild {
 			result = parentLookup{overwrites: gc.PermissionOverwrites(), at: time.Now(), ok: true}
 		}
+	} else {
+		// Cached for botPermsTTL, so every thread under this parent skips the guard.
+		e.logger.Warn("look up thread parent overwrites, permission guard fails open",
+			idField("parent_channel_id", uint64(channelID)), zap.Error(err))
 	}
 
 	s.parentMu.Lock()
@@ -101,6 +106,8 @@ func (e *Engine) missingPermissionsForChannel(ctx context.Context, state *execSt
 
 	ch, err := e.client.Rest.GetChannel(channelID, rest.WithCtx(ctx))
 	if err != nil {
+		e.logger.Warn("look up channel for permission check, guard fails open",
+			idField("channel_id", uint64(channelID)), zap.Error(err))
 		return 0
 	}
 	gc, isGuild := ch.(discord.GuildChannel)
