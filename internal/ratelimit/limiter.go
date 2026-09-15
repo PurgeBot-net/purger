@@ -42,6 +42,9 @@ func newWith(inner rest.RateLimiter, logger *zap.Logger) *Limiter {
 }
 
 func (l *Limiter) Unlock(endpoint *rest.CompiledEndpoint, rs *http.Response) error {
+	if rs != nil && rs.Header != nil {
+		preciseReset(rs.Header)
+	}
 	if rs != nil && rs.Header != nil && rs.StatusCode == http.StatusTooManyRequests {
 		delay, header := normaliseRetryAfter(rs.Header.Get("Retry-After"))
 		// Rewritten in place before delegating: the inner Unlock parses this with
@@ -56,7 +59,12 @@ func (l *Limiter) Unlock(endpoint *rest.CompiledEndpoint, rs *http.Response) err
 		case rs.Header.Get("via") == "":
 			l.logger.Warn("cloudflare rate limit exceeded", fields...)
 		default:
-			l.logger.Debug("rate limit exceeded", fields...)
+			// scope separates a shared limit from one that spends the invalid-request budget.
+			l.logger.Debug("rate limit exceeded", append(fields,
+				zap.String("scope", rs.Header.Get("X-RateLimit-Scope")),
+				zap.String("bucket", rs.Header.Get("X-RateLimit-Bucket")),
+				zap.String("remaining", rs.Header.Get("X-RateLimit-Remaining")),
+			)...)
 		}
 	}
 
@@ -87,6 +95,24 @@ func endpointFields(endpoint *rest.CompiledEndpoint) []zap.Field {
 		zap.String("method", endpoint.Endpoint.Method),
 		zap.String("route", endpoint.Endpoint.Route),
 	}
+}
+
+// disgo converts reset-after with time.Duration(float64), which truncates: 0.462 becomes a
+// zero wait, so the next request fires into a window Discord is still counting and earns a
+// 429. Its absolute-reset branch keeps sub-second precision, so the reset goes over that way,
+// off the local clock because that is why disgo prefers reset-after in the first place.
+func preciseReset(header http.Header) {
+	raw := strings.TrimSpace(header.Get("X-RateLimit-Reset-After"))
+	if raw == "" {
+		return
+	}
+	resetAfter, err := strconv.ParseFloat(raw, 64)
+	if err != nil || resetAfter <= 0 {
+		return
+	}
+	reset := time.Now().Add(time.Duration(resetAfter * float64(time.Second)))
+	header.Del("X-RateLimit-Reset-After")
+	header.Set("X-RateLimit-Reset", strconv.FormatFloat(float64(reset.UnixNano())/1e9, 'f', 3, 64))
 }
 
 // Discord may answer with a fractional retry_after, which disgo's strconv.Atoi rejects.

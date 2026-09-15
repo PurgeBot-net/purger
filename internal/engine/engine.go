@@ -609,7 +609,7 @@ func (e *Engine) deleteBatch(ctx context.Context, state *execState, ch *job.Purg
 	}
 	if ratelimit.IsTooManyRequests(err) {
 		e.commit(ctx, state, func() { clearPendingDeletes(ch) })
-		e.logger.Warn("bulk delete still rate limited after retries",
+		e.logger.Warn("delete still rate limited after retries",
 			idField("channel_id", channelID), zap.Int("batch", len(batch)), zap.Error(err))
 		return len(batch), nil
 	}

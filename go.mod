@@ -7,7 +7,7 @@ go 1.26
 // replace github.com/PurgeBot-net/locale => ../locale
 
 require (
-	github.com/PurgeBot-net/common v0.0.0-20260914191709-5f4bfb86b90d
+	github.com/PurgeBot-net/common v0.0.0-20260915191320-17f6782afc92
 	github.com/PurgeBot-net/database v0.0.0-20260822211030-5f1758be9f51
 	github.com/PurgeBot-net/locale v0.0.0-20260906202341-654f7246cefa
 	github.com/caarlos0/env/v11 v11.4.1
