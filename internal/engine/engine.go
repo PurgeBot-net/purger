@@ -816,7 +816,12 @@ func (e *Engine) Execute(ctx context.Context, j *job.PurgeJob) error {
 	defer abort(nil)
 
 	g, gctx := errgroup.WithContext(jobCtx)
-	g.SetLimit(min(max(e.cfg.ChannelConcurrency, 1), max(len(pending), 1)))
+	// SetLimit(0) deadlocks, and -1 would uncap a group already bounded by len(pending).
+	channelLimit := e.cfg.ChannelConcurrency
+	if channelLimit <= 0 {
+		channelLimit = len(pending)
+	}
+	g.SetLimit(min(max(channelLimit, 1), max(len(pending), 1)))
 
 	var inFlight sync.Map
 	workers := new(sync.WaitGroup)
