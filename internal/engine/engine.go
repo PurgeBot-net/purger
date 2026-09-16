@@ -33,11 +33,24 @@ const (
 	maxPagesBeforeFlush   = 20
 	cancelPollInterval    = time.Second
 	statusRefreshInterval = 5 * time.Second
+
+	// Past an hour Discord caps edits per message against an unpublished budget.
+	slowStatusRefreshInterval = 30 * time.Second
+	slowStatusRefreshAfter    = time.Hour
+
+	// Anchored to the interaction, not the deferred reply, so j.CreatedAt is the clock.
+	interactionTokenTTL = 15 * time.Minute
+	tokenHandoverLead   = time.Minute
+
+	maxCreateAttempts = 3
 )
 
 var (
 	ErrInterrupted = errors.New("purge interrupted")
 	ErrCancelled   = errors.New("purge cancelled")
+
+	// Never returned to the worker: it only tells sendCompletion the summary reached nobody.
+	errNoStatusSurface = errors.New("no status surface available")
 )
 
 type Engine struct {
@@ -111,6 +124,27 @@ type execState struct {
 	// are sent by editing a regular channel message instead.
 	fallbackChannelID snowflake.ID
 	fallbackMessageID snowflake.ID
+	dmChannelID       snowflake.ID
+	guildName         string
+	// Latches only ever turn on: a 5s ticker re-issuing the same rejection for a multi-hour
+	// run is what the invalid-request limit punishes.
+	tokenDead      bool
+	channelDenied  bool
+	dmDenied       bool
+	guildNameTried bool
+	// Unclassified create failures are counted rather than latched: one 500 must not close a
+	// rung for a run that lasts hours.
+	channelAttempts int
+	dmAttempts      int
+	// The message a 30046 replacement abandoned, deleted once its replacement exists.
+	staleChannelID snowflake.ID
+	staleMessageID snowflake.ID
+}
+
+// Reports whether an unclassified failure has closed a rung for good.
+func (s *execState) spent(attempts *int) bool {
+	*attempts++
+	return *attempts >= maxCreateAttempts
 }
 
 func newExecState(j *job.PurgeJob) (*execState, error) {
@@ -127,7 +161,8 @@ func newExecState(j *job.PurgeJob) (*execState, error) {
 		}
 		re, err := regexp.Compile(pattern)
 		if err != nil {
-			return nil, fmt.Errorf("%s", locale.MsgPurgeInvalidRegex.In(j.Locale, err.Error()))
+			// Returned initialised anyway: Execute reports this through the status surface.
+			return s, fmt.Errorf("%s", locale.MsgPurgeInvalidRegex.In(j.Locale, err.Error()))
 		}
 		s.filterRegex = re
 	}
@@ -272,32 +307,121 @@ func interactionResponseStillLoading(msg *discord.Message) bool {
 	return msg != nil && msg.Flags.Has(discord.MessageFlagLoading)
 }
 
-func shouldCreateStatusMessageAfterInteractionError(err error) bool {
-	return rest.IsJSONErrorCode(err, rest.JSONErrorCodeInvalidWebhookToken, rest.JSONErrorCodeUnknownWebhook)
+// FallbackChannelID is only ever written from a create in j.InteractionChannelID or from the
+// interaction response's own channel, so anything else is the DM. With no invoking channel
+// recorded the two are indistinguishable, and guessing puts a DM header on a public message.
+func statusSurfaceIsDM(fallbackChannelID snowflake.ID, interactionChannelID uint64) bool {
+	return interactionChannelID != 0 && fallbackChannelID != 0 &&
+		uint64(fallbackChannelID) != interactionChannelID
 }
 
-func shouldReplaceStatusMessageAfterUpdateError(err error) bool {
+func statusMessageGone(err error) bool {
 	return rest.IsJSONErrorCode(err, rest.JSONErrorCodeUnknownMessage)
 }
 
-func (e *Engine) createStatusMessage(ctx context.Context, j *job.PurgeJob, components ...discord.LayoutComponent) (snowflake.ID, snowflake.ID, bool) {
-	if j.InteractionChannelID == 0 {
-		return 0, 0, false
-	}
-	msg, err := e.client.Rest.CreateMessage(
-		snowflake.ID(j.InteractionChannelID),
-		discord.NewMessageCreateV2(components...),
+func statusChannelUnavailable(err error) bool {
+	return rest.IsJSONErrorCode(err,
+		rest.JSONErrorCodeMissingAccess,
+		rest.JSONErrorCodeLackPermissionsToPerformAction,
+		rest.JSONErrorCodeUnknownChannel,
 	)
+}
+
+func tokenExpiredError(err error) bool {
+	return rest.IsJSONErrorCode(err, rest.JSONErrorCodeInvalidWebhookToken)
+}
+
+// 10015 is a propagation race right after the defer, not expiry: abandoning the token here
+// leaves a duplicate status message behind.
+func webhookNotPropagated(err error) bool {
+	return rest.IsJSONErrorCode(err, rest.JSONErrorCodeUnknownWebhook)
+}
+
+func dmDeliveryRefused(err error) bool {
+	return rest.IsJSONErrorCode(err,
+		rest.JSONErrorCodeCannotSendMessagesToThisUser,
+		rest.JSONErrorCodeCannotSendMessagesToThisUserDueToHavingNoMutualGuilds,
+		rest.JSONErrorCodeInvalidRecipients,
+	)
+}
+
+func dmOpenThrottled(err error) bool {
+	return rest.IsJSONErrorCode(err, rest.JSONErrorCodeOpeningDirectMessagesTooFast)
+}
+
+func editCapReached(err error) bool {
+	return rest.IsJSONErrorCode(err, rest.JSONErrorCodeMaximumEditsToMessagesOlderThan1HourReached)
+}
+
+func statusRefreshIntervalFor(elapsed time.Duration) time.Duration {
+	if elapsed >= slowStatusRefreshAfter {
+		return slowStatusRefreshInterval
+	}
+	return statusRefreshInterval
+}
+
+// Only ever used to suppress a call that is certainly dead, never to abandon a working surface.
+func interactionTokenSpent(createdAt, now time.Time) bool {
+	return !createdAt.IsZero() && now.Sub(createdAt) >= interactionTokenTTL
+}
+
+// Fires early, and only while the webhook is the last surface left. No error code can report
+// an expiry that has not happened yet, so this is the one clock-driven transition.
+func shouldHandOverBeforeTokenExpiry(createdAt, now time.Time, onWebhook, channelRungClosed, tokenDead bool) bool {
+	if !onWebhook || tokenDead || !channelRungClosed || createdAt.IsZero() {
+		return false
+	}
+	return now.Sub(createdAt) >= interactionTokenTTL-tokenHandoverLead
+}
+
+// A button in a DM reaches HandleCancel, which answers with UpdateMessage and would clobber the
+// surface the status ticker is editing, so the row is replaced by a hint naming /cancel.
+func dmComponents(components []discord.LayoutComponent, header, hint string) []discord.LayoutComponent {
+	out := make([]discord.LayoutComponent, 0, len(components))
+	droppedRow := false
+	headered := false
+	for _, c := range components {
+		container, ok := c.(discord.ContainerComponent)
+		if !ok {
+			if _, isRow := c.(discord.ActionRowComponent); isRow {
+				droppedRow = true
+				continue
+			}
+			out = append(out, c)
+			continue
+		}
+		if !headered {
+			subs := make([]discord.ContainerSubComponent, 0, len(container.Components)+2)
+			subs = append(subs, discord.NewTextDisplay(header))
+			container.Components = append(subs, container.Components...)
+			headered = true
+		}
+		out = append(out, container)
+	}
+	if !droppedRow || !headered {
+		return out
+	}
+	for i := len(out) - 1; i >= 0; i-- {
+		if container, ok := out[i].(discord.ContainerComponent); ok {
+			container.Components = append(container.Components, discord.NewTextDisplay(hint))
+			out[i] = container
+			break
+		}
+	}
+	return out
+}
+
+// No context parameter: a rest.WithCtx here would cancel the completion message at shutdown.
+func (e *Engine) createStatusMessage(destination snowflake.ID, components ...discord.LayoutComponent) (snowflake.ID, snowflake.ID, error) {
+	msg, err := e.client.Rest.CreateMessage(destination, discord.NewMessageCreateV2(components...))
 	if err != nil {
-		e.logger.Warn("create channel status message",
-			idField("interaction_channel_id", j.InteractionChannelID), zap.Error(err))
-		return 0, 0, false
+		return 0, 0, err
 	}
 	channelID := msg.ChannelID
 	if channelID == 0 {
-		channelID = snowflake.ID(j.InteractionChannelID)
+		channelID = destination
 	}
-	return channelID, msg.ID, true
+	return channelID, msg.ID, nil
 }
 
 func (e *Engine) adoptInteractionResponseTarget(ctx context.Context, j *job.PurgeJob, state *execState) {
@@ -310,6 +434,10 @@ func (e *Engine) adoptInteractionResponseTarget(ctx context.Context, j *job.Purg
 		state.commandMessageID = msg.ID
 		state.exclude(msg.ID)
 	}
+	// Re-adopting a refused channel makes every later webhook edit adopt it again: a 403 a tick.
+	if state.channelDenied {
+		return
+	}
 	if channelID, messageID, ok := statusTargetFromInteractionResponse(msg); ok {
 		e.setStatusTarget(ctx, state, channelID, messageID)
 	}
@@ -319,9 +447,10 @@ func (e *Engine) dismissStaleInteractionMessage(j *job.PurgeJob, state *execStat
 	if state.commandMessageID == 0 || state.commandMessageID == newMessageID {
 		return
 	}
-	channelID := state.fallbackChannelID
-	if channelID == 0 && j.InteractionChannelID != 0 {
-		channelID = snowflake.ID(j.InteractionChannelID)
+	// The deferred reply lives in the invoking channel; fallbackChannelID may now be a DM.
+	channelID := snowflake.ID(j.InteractionChannelID)
+	if channelID == 0 && !statusSurfaceIsDM(state.fallbackChannelID, j.InteractionChannelID) {
+		channelID = state.fallbackChannelID
 	}
 	if channelID == 0 {
 		return
@@ -646,79 +775,51 @@ func (e *Engine) Execute(ctx context.Context, j *job.PurgeJob) error {
 	}
 
 	// Set up the response channel before anything else so errors can always be delivered.
-	var commandMsgID, fallbackChanID, fallbackMsgID snowflake.ID
-	statusJustCreated := false
+	state, stateErr := newExecState(j)
 	if progress != nil {
-		commandMsgID = snowflake.ID(progress.CommandMessageID)
-		fallbackChanID = snowflake.ID(progress.FallbackChannelID)
-		fallbackMsgID = snowflake.ID(progress.FallbackMessageID)
+		state.commandMessageID = snowflake.ID(progress.CommandMessageID)
+		state.fallbackChannelID = snowflake.ID(progress.FallbackChannelID)
+		state.fallbackMessageID = snowflake.ID(progress.FallbackMessageID)
 	}
-	if fallbackMsgID == 0 {
-		if msg, err := e.client.Rest.GetInteractionResponse(snowflake.ID(j.ApplicationID), j.InteractionToken); err == nil {
-			commandMsgID = msg.ID
-			if _, _, ok := statusTargetFromInteractionResponse(msg); !ok {
-				startContainer := discord.NewContainer(
-					discord.NewTextDisplay(locale.MsgPurgeInProgress.In(j.Locale, target)),
-					discord.NewTextDisplay(locale.MsgPurgeStatusLabel.In(j.Locale, locale.MsgPurgeStatusStarting.In(j.Locale))),
-				)
-				if channelID, messageID, ok := e.createStatusMessage(ctx, j, startContainer, cancelButton(j)); ok {
-					e.dismissStaleInteractionMessage(j, &execState{commandMessageID: commandMsgID}, messageID)
-					fallbackChanID = channelID
-					fallbackMsgID = messageID
-					statusJustCreated = true
-				}
-			}
-		} else if j.InteractionChannelID == 0 {
-			// The purge still runs, but nothing can report it back to the user.
-			e.logger.Warn("interaction response unavailable and no channel to fall back to",
-				idField("application_id", j.ApplicationID), zap.Error(err))
-		} else {
-			e.logger.Info("interaction response unavailable, creating channel status message",
-				idField("interaction_channel_id", j.InteractionChannelID),
-				idField("application_id", j.ApplicationID),
-				zap.Error(err),
-			)
-			startContainer := discord.NewContainer(
-				discord.NewTextDisplay(locale.MsgPurgeInProgress.In(j.Locale, target)),
-				discord.NewTextDisplay(locale.MsgPurgeStatusLabel.In(j.Locale, locale.MsgPurgeStatusStarting.In(j.Locale))),
-			)
-			if channelID, messageID, ok := e.createStatusMessage(ctx, j, startContainer, cancelButton(j)); ok {
-				fallbackChanID = channelID
-				fallbackMsgID = messageID
-				statusJustCreated = true
-			}
-		}
-	} else if fallbackChanID != 0 && fallbackMsgID != 0 {
-		msg, err := e.client.Rest.GetMessage(fallbackChanID, fallbackMsgID)
+	// A stored DM target records that both earlier rungs were refused.
+	if statusSurfaceIsDM(state.fallbackChannelID, j.InteractionChannelID) {
+		state.dmChannelID = state.fallbackChannelID
+		state.tokenDead = true
+		state.channelDenied = true
+	}
+
+	statusJustCreated := false
+	if state.fallbackMessageID == 0 {
+		statusJustCreated = e.openStatusSurface(ctx, j, state, target)
+	} else if state.fallbackChannelID != 0 {
+		msg, err := e.client.Rest.GetMessage(state.fallbackChannelID, state.fallbackMessageID)
 		if err != nil {
 			e.logger.Warn("fetch restored status message",
-				idField("channel_id", uint64(fallbackChanID)),
-				idField("message_id", uint64(fallbackMsgID)),
+				idField("channel_id", uint64(state.fallbackChannelID)),
+				idField("message_id", uint64(state.fallbackMessageID)),
 				zap.Error(err),
 			)
 		} else if interactionResponseStillLoading(msg) {
 			e.logger.Info("restored status message still loading, re-acknowledging via interaction webhook",
-				idField("channel_id", uint64(fallbackChanID)),
-				idField("message_id", uint64(fallbackMsgID)),
+				idField("channel_id", uint64(state.fallbackChannelID)),
+				idField("message_id", uint64(state.fallbackMessageID)),
 				idField("command_message_id", progress.CommandMessageID),
 			)
-			commandMsgID = snowflake.ID(progress.CommandMessageID)
-			fallbackChanID = 0
-			fallbackMsgID = 0
+			state.commandMessageID = snowflake.ID(progress.CommandMessageID)
+			state.fallbackChannelID = 0
+			state.fallbackMessageID = 0
 			progress.FallbackChannelID = 0
 			progress.FallbackMessageID = 0
 		}
 	}
 
-	state, err := newExecState(j)
-	if err != nil {
-		errState := &execState{fallbackChannelID: fallbackChanID, fallbackMessageID: fallbackMsgID}
-		e.updateText(ctx, j, errState, fmt.Sprintf("❌ %s", err.Error()))
-		return fmt.Errorf("compile filter: %w", err)
+	if stateErr != nil {
+		e.updateText(ctx, j, state, fmt.Sprintf("❌ %s", stateErr.Error()))
+		return fmt.Errorf("compile filter: %w", stateErr)
 	}
-	state.commandMessageID = commandMsgID
-	state.fallbackChannelID = fallbackChanID
-	state.fallbackMessageID = fallbackMsgID
+	commandMsgID := state.commandMessageID
+	fallbackChanID := state.fallbackChannelID
+	fallbackMsgID := state.fallbackMessageID
 
 	resumed := progress != nil
 
@@ -848,19 +949,39 @@ func (e *Engine) Execute(ctx context.Context, j *job.PurgeJob) error {
 		}
 	}()
 
-	// The status message is edited only from here, never from a channel goroutine.
+	// The status message is edited only from here, never from a channel goroutine, which also
+	// makes this the sole writer of the surface fields until workers.Wait().
 	go func() {
 		defer workers.Done()
-		ticker := time.NewTicker(statusRefreshInterval)
+		interval := statusRefreshIntervalFor(time.Since(progress.StartedAt))
+		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
 		for {
 			select {
 			case <-gctx.Done():
 				return
 			case <-ticker.C:
+				if want := statusRefreshIntervalFor(time.Since(progress.StartedAt)); want != interval {
+					interval = want
+					ticker.Reset(interval)
+				}
 				names := inFlightNames(progress.ChannelIDs, &inFlight)
+				// Before the empty-names skip below, which would swallow it between channels.
+				onWebhook := state.fallbackChannelID == 0 || state.fallbackMessageID == 0
+				channelRungClosed := state.channelDenied || j.InteractionChannelID == 0
+				if shouldHandOverBeforeTokenExpiry(j.CreatedAt, time.Now(), onWebhook, channelRungClosed, state.tokenDead) {
+					status := locale.MsgPurgeStatusFetching.In(j.Locale, names)
+					if names == "" {
+						status = locale.MsgPurgeStatusStarting.In(j.Locale)
+					}
+					e.handOverBeforeTokenExpiry(ctx, j, state, target, status)
+					continue
+				}
 				if names == "" {
 					continue
+				}
+				if webhookRungClosed(j, state) && state.channelDenied && state.dmDenied {
+					return
 				}
 				e.sendInProgress(ctx, j, state, target, locale.MsgPurgeStatusFetching.In(j.Locale, names), true)
 			}
@@ -967,6 +1088,7 @@ func (e *Engine) logOutcome(outcome string, j *job.PurgeJob, state *execState, s
 		zap.Int("channels", len(results)),
 		zap.Int("failed", failed),
 		zap.Bool("resumed", resumed),
+		zap.String("surface", statusSurfaceName(j, state)),
 		zap.Duration("run_duration", time.Since(start)),
 		zap.Duration("total_duration", time.Since(state.progress.StartedAt)),
 	}, extra...)
@@ -1449,7 +1571,7 @@ func cancelButton(j *job.PurgeJob) discord.ActionRowComponent {
 	}}
 }
 
-func (e *Engine) sendInProgress(ctx context.Context, j *job.PurgeJob, state *execState, target, status string, withCancel bool) {
+func (e *Engine) inProgressComponents(j *job.PurgeJob, target, status string, withCancel bool) []discord.LayoutComponent {
 	container := discord.NewContainer(
 		discord.NewTextDisplay(locale.MsgPurgeInProgress.In(j.Locale, target)),
 		discord.NewTextDisplay(locale.MsgPurgeStatusLabel.In(j.Locale, status)),
@@ -1458,7 +1580,11 @@ func (e *Engine) sendInProgress(ctx context.Context, j *job.PurgeJob, state *exe
 	if withCancel {
 		components = append(components, cancelButton(j))
 	}
-	e.updateComponents(ctx, j, state, components...)
+	return components
+}
+
+func (e *Engine) sendInProgress(ctx context.Context, j *job.PurgeJob, state *execState, target, status string, withCancel bool) {
+	e.updateComponents(ctx, j, state, e.inProgressComponents(j, target, status, withCancel)...)
 }
 
 func (e *Engine) sendCancelled(ctx context.Context, j *job.PurgeJob, state *execState, totalDeleted int, showBranding bool) {
@@ -1470,7 +1596,10 @@ func (e *Engine) sendCancelled(ctx context.Context, j *job.PurgeJob, state *exec
 	if showBranding {
 		texts = append(texts, discord.NewTextDisplay("-# Powered by PurgeBot"))
 	}
-	e.updateComponents(ctx, j, state, discord.NewContainer(texts...))
+	if err := e.deliverFinal(ctx, j, state, discord.NewContainer(texts...)); err != nil {
+		e.logger.Error("deliver purge cancellation message",
+			append(surfaceFields(j, state), zap.Error(err))...)
+	}
 }
 
 func (e *Engine) sendCompletion(ctx context.Context, j *job.PurgeJob, state *execState, target string, totalDeleted int, elapsed time.Duration, results []channelResult, showBranding bool) {
@@ -1502,68 +1631,331 @@ func (e *Engine) sendCompletion(ctx context.Context, j *job.PurgeJob, state *exe
 	if showBranding {
 		texts = append(texts, discord.NewTextDisplay("-# Powered by PurgeBot"))
 	}
-	if err := e.updateComponents(ctx, j, state, discord.NewContainer(texts...)); err != nil {
+	if err := e.deliverFinal(ctx, j, state, discord.NewContainer(texts...)); err != nil {
 		e.logger.Error("deliver purge completion message",
-			zap.Int("deleted", totalDeleted), zap.Error(err))
+			append(surfaceFields(j, state), zap.Int("deleted", totalDeleted), zap.Error(err))...)
 	}
+}
+
+// For the two messages with no next tick to retry on. A rung that fails unclassified stops the
+// ladder where it happened, so step past it rather than re-issuing the same call.
+func (e *Engine) deliverFinal(ctx context.Context, j *job.PurgeJob, state *execState, components ...discord.LayoutComponent) error {
+	err := e.updateComponents(ctx, j, state, components...)
+	if err == nil || errors.Is(err, errNoStatusSurface) {
+		return err
+	}
+	if state.fallbackChannelID == 0 || state.fallbackMessageID == 0 {
+		state.tokenDead = true
+	}
+	e.clearStatusTarget(ctx, state)
+	return e.updateComponents(ctx, j, state, components...)
+}
+
+func surfaceFields(j *job.PurgeJob, state *execState) []zap.Field {
+	return []zap.Field{
+		zap.String("surface", statusSurfaceName(j, state)),
+		zap.Bool("token_dead", state.tokenDead),
+		zap.Bool("channel_denied", state.channelDenied),
+		zap.Bool("dm_denied", state.dmDenied),
+	}
+}
+
+func statusSurfaceName(j *job.PurgeJob, state *execState) string {
+	switch {
+	case state.fallbackChannelID != 0 && state.fallbackMessageID != 0:
+		return deliveryName(statusSurfaceIsDM(state.fallbackChannelID, j.InteractionChannelID))
+	case !webhookRungClosed(j, state):
+		return "interaction_webhook"
+	default:
+		return "none"
+	}
+}
+
+// The rung is skipped on the clock as well as on the latch, so both readers must agree or the
+// outcome line reports a webhook that was never used.
+func webhookRungClosed(j *job.PurgeJob, state *execState) bool {
+	return state.tokenDead || interactionTokenSpent(j.CreatedAt, time.Now())
+}
+
+// The 30046 replacement leaves its predecessor frozen in the channel, and setStatusTarget has
+// excluded it from deletion, so the purge will not clean it up either.
+func (e *Engine) discardStaleStatusMessage(state *execState) {
+	if state.staleChannelID == 0 || state.staleMessageID == 0 {
+		return
+	}
+	if err := e.client.Rest.DeleteMessage(state.staleChannelID, state.staleMessageID); err != nil {
+		e.logger.Warn("delete replaced status message",
+			idField("channel_id", uint64(state.staleChannelID)),
+			idField("message_id", uint64(state.staleMessageID)), zap.Error(err))
+	}
+	state.staleChannelID, state.staleMessageID = 0, 0
 }
 
 func (e *Engine) updateText(ctx context.Context, j *job.PurgeJob, state *execState, text string) {
 	e.updateComponents(ctx, j, state, discord.NewContainer(discord.NewTextDisplay(text)))
 }
 
-// The error is returned for the completion message, the one edit with no later retry.
+// One surface at a time, moving one way only:
+//
+//	interaction webhook -> channel message -> requester DM -> none
+//
+// Each rung latches on refusal. The error is returned for the completion message, the one
+// edit with no later retry.
 func (e *Engine) updateComponents(ctx context.Context, j *job.PurgeJob, state *execState, components ...discord.LayoutComponent) error {
 	if state.fallbackChannelID != 0 && state.fallbackMessageID != 0 {
+		toDM := statusSurfaceIsDM(state.fallbackChannelID, j.InteractionChannelID)
+		payload := components
+		if toDM {
+			payload = e.dmPayload(j, state, components)
+		}
 		_, err := e.client.Rest.UpdateMessage(
 			state.fallbackChannelID,
 			state.fallbackMessageID,
-			discord.NewMessageUpdateV2(components...),
+			discord.NewMessageUpdateV2(payload...),
 		)
-		if err != nil {
-			target := []zap.Field{
-				zap.String("delivery", "channel_message"),
-				idField("channel_id", uint64(state.fallbackChannelID)),
-				idField("message_id", uint64(state.fallbackMessageID)),
+		if err == nil {
+			return nil
+		}
+		target := []zap.Field{
+			zap.String("delivery", deliveryName(toDM)),
+			idField("channel_id", uint64(state.fallbackChannelID)),
+			idField("message_id", uint64(state.fallbackMessageID)),
+		}
+		switch {
+		case statusMessageGone(err):
+			// An adopted target is the interaction response, so the webhook rung is the same message.
+			if state.fallbackMessageID == state.commandMessageID {
+				state.tokenDead = true
 			}
-			if shouldReplaceStatusMessageAfterUpdateError(err) {
-				e.logger.Info("status message disappeared, creating replacement", append(target, zap.Error(err))...)
-				e.clearStatusTarget(ctx, state)
-				if channelID, messageID, ok := e.createStatusMessage(ctx, j, components...); ok {
-					e.setStatusTarget(ctx, state, channelID, messageID)
-					return nil
-				}
-			}
+			e.logger.Info("status message disappeared, falling back", append(target, zap.Error(err))...)
+			e.clearStatusTarget(ctx, state)
+		case editCapReached(err):
+			// A fresh message is not an edit, so this sidesteps the cap rather than latching.
+			e.logger.Info("status message edit cap reached, replacing message", append(target, zap.Error(err))...)
+			state.staleChannelID, state.staleMessageID = state.fallbackChannelID, state.fallbackMessageID
+			e.clearStatusTarget(ctx, state)
+		case statusChannelUnavailable(err) && toDM:
+			state.dmChannelID = 0
+			e.logger.Info("direct message surface unavailable, falling back", append(target, zap.Error(err))...)
+			e.clearStatusTarget(ctx, state)
+		case statusChannelUnavailable(err):
+			state.channelDenied = true
+			e.logger.Info("status channel refused the edit, surface demoted", append(target, zap.Error(err))...)
+			e.clearStatusTarget(ctx, state)
+		default:
 			e.logger.Warn("update status message", append(target, zap.Error(err))...)
 			return err
 		}
-		return nil
 	}
 
 	// The first edit after a deferred response must go through the interaction
 	// webhook so Discord clears the "Bot is thinking..." loading state.
-	_, err := e.client.Rest.UpdateInteractionResponse(
-		snowflake.ID(j.ApplicationID),
-		j.InteractionToken,
-		discord.NewMessageUpdateV2(components...),
-	)
-	if err != nil {
+	if !webhookRungClosed(j, state) {
+		_, err := e.client.Rest.UpdateInteractionResponse(
+			snowflake.ID(j.ApplicationID),
+			j.InteractionToken,
+			discord.NewMessageUpdateV2(components...),
+		)
 		target := []zap.Field{
 			zap.String("delivery", "interaction_webhook"),
 			idField("application_id", j.ApplicationID),
 			idField("command_message_id", uint64(state.commandMessageID)),
 		}
-		if shouldCreateStatusMessageAfterInteractionError(err) {
-			e.logger.Info("interaction token expired, switching to channel status message", append(target, zap.Error(err))...)
-			if channelID, messageID, ok := e.createStatusMessage(ctx, j, components...); ok {
-				e.dismissStaleInteractionMessage(j, state, messageID)
-				e.setStatusTarget(ctx, state, channelID, messageID)
-				return nil
-			}
+		switch {
+		case err == nil:
+			e.adoptInteractionResponseTarget(ctx, j, state)
+			return nil
+		case tokenExpiredError(err):
+			state.tokenDead = true
+			e.logger.Info("interaction token expired", append(target, zap.Error(err))...)
+		case webhookNotPropagated(err):
+			// Retried next tick; interactionTokenSpent bounds that to the token's own lifetime.
+			e.logger.Info("interaction webhook not yet propagated, retrying next tick",
+				append(target, zap.Error(err))...)
+			return err
+		default:
+			e.logger.Warn("update interaction", append(target, zap.Error(err))...)
+			return err
 		}
-		e.logger.Warn("update interaction", append(target, zap.Error(err))...)
-		return err
 	}
-	e.adoptInteractionResponseTarget(ctx, j, state)
-	return nil
+
+	if !state.channelDenied && j.InteractionChannelID != 0 {
+		channelID, messageID, err := e.createStatusMessage(snowflake.ID(j.InteractionChannelID), components...)
+		if err == nil {
+			e.discardStaleStatusMessage(state)
+			e.dismissStaleInteractionMessage(j, state, messageID)
+			e.setStatusTarget(ctx, state, channelID, messageID)
+			return nil
+		}
+		if statusChannelUnavailable(err) || state.spent(&state.channelAttempts) {
+			state.channelDenied = true
+		}
+		e.logger.Info("cannot create a channel status message",
+			idField("interaction_channel_id", j.InteractionChannelID),
+			zap.Bool("denied", state.channelDenied), zap.Error(err))
+	}
+
+	if e.openDMSurface(ctx, j, state, components...) {
+		return nil
+	}
+	return errNoStatusSurface
+}
+
+func deliveryName(toDM bool) string {
+	if toDM {
+		return "direct_message"
+	}
+	return "channel_message"
+}
+
+// Looked up here rather than in openDMSurface so a resumed run, which adopts a stored DM target
+// without reopening it, still names the guild.
+func (e *Engine) dmPayload(j *job.PurgeJob, state *execState, components []discord.LayoutComponent) []discord.LayoutComponent {
+	if state.guildName == "" && !state.guildNameTried {
+		state.guildNameTried = true
+		if g, err := e.client.Rest.GetGuild(snowflake.ID(j.GuildID), false); err == nil {
+			state.guildName = g.Name
+		}
+	}
+	guild := state.guildName
+	if guild == "" {
+		guild = locale.MsgTargetServer.In(j.Locale)
+	}
+	return dmComponents(components,
+		locale.MsgPurgeDMHeader.In(j.Locale, guild),
+		locale.MsgPurgeDMCancelHint.In(j.Locale),
+	)
+}
+
+// Opened at most once per run: POST /users/@me/channels is separately rate limited.
+// Reachability cannot be probed; the first send is the probe.
+func (e *Engine) openDMSurface(ctx context.Context, j *job.PurgeJob, state *execState, components ...discord.LayoutComponent) bool {
+	if state.dmDenied || j.RequestedByID == 0 {
+		return false
+	}
+	if state.dmChannelID == 0 {
+		dm, err := e.client.Rest.CreateDMChannel(snowflake.ID(j.RequestedByID))
+		if err != nil {
+			// Still consumes an attempt: the handover cannot complete until this resolves.
+			if dmOpenThrottled(err) {
+				if state.spent(&state.dmAttempts) {
+					state.dmDenied = true
+				}
+				e.logger.Warn("opening requester DM throttled",
+					idField("requested_by_id", j.RequestedByID),
+					zap.Bool("denied", state.dmDenied), zap.Error(err))
+				return false
+			}
+			if dmDeliveryRefused(err) || state.spent(&state.dmAttempts) {
+				state.dmDenied = true
+			}
+			e.logger.Warn("open requester DM",
+				idField("requested_by_id", j.RequestedByID),
+				zap.Bool("denied", state.dmDenied), zap.Error(err))
+			return false
+		}
+		state.dmChannelID = dm.ID()
+	}
+
+	channelID, messageID, err := e.createStatusMessage(state.dmChannelID, e.dmPayload(j, state, components)...)
+	if err != nil {
+		if dmDeliveryRefused(err) || state.spent(&state.dmAttempts) {
+			state.dmDenied = true
+		}
+		e.logger.Warn("direct message status surface refused",
+			idField("requested_by_id", j.RequestedByID),
+			idField("dm_channel_id", uint64(state.dmChannelID)),
+			zap.Error(err),
+		)
+		return false
+	}
+	e.setStatusTarget(ctx, state, channelID, messageID)
+	e.discardStaleStatusMessage(state)
+	e.logger.Info("direct message status surface opened",
+		idField("requested_by_id", j.RequestedByID),
+		idField("dm_channel_id", uint64(channelID)),
+	)
+	return true
+}
+
+// Reports whether a fresh status message was posted, so Execute can skip the opening edit.
+func (e *Engine) openStatusSurface(ctx context.Context, j *job.PurgeJob, state *execState, target string) bool {
+	startComponents := e.inProgressComponents(j, target, locale.MsgPurgeStatusStarting.In(j.Locale), true)
+
+	switch {
+	case state.tokenDead || interactionTokenSpent(j.CreatedAt, time.Now()):
+		// A recovered job's token is dead by arithmetic, and progress already has the ID.
+		state.tokenDead = true
+	default:
+		msg, err := e.client.Rest.GetInteractionResponse(snowflake.ID(j.ApplicationID), j.InteractionToken)
+		if err == nil {
+			if msg.ID != 0 {
+				state.commandMessageID = msg.ID
+				state.exclude(msg.ID)
+			}
+			// Adoptable: the webhook rung clears the spinner and updateComponents adopts it.
+			if _, _, ok := statusTargetFromInteractionResponse(msg); ok {
+				return false
+			}
+			break
+		}
+		// Falling through would post a second status message a tick before the webhook works.
+		if webhookNotPropagated(err) {
+			e.logger.Info("interaction webhook not yet propagated, leaving the surface to the ticker",
+				idField("application_id", j.ApplicationID), zap.Error(err))
+			return false
+		}
+		if tokenExpiredError(err) {
+			state.tokenDead = true
+		}
+		e.logger.Info("interaction response unavailable",
+			idField("application_id", j.ApplicationID), zap.Error(err))
+	}
+
+	if !state.channelDenied && j.InteractionChannelID != 0 {
+		channelID, messageID, err := e.createStatusMessage(snowflake.ID(j.InteractionChannelID), startComponents...)
+		if err == nil {
+			e.dismissStaleInteractionMessage(j, state, messageID)
+			e.setStatusTarget(ctx, state, channelID, messageID)
+			return true
+		}
+		if statusChannelUnavailable(err) || state.spent(&state.channelAttempts) {
+			state.channelDenied = true
+		}
+		e.logger.Info("cannot create a channel status message",
+			idField("interaction_channel_id", j.InteractionChannelID),
+			zap.Bool("denied", state.channelDenied), zap.Error(err))
+	}
+
+	// With the token gone too, nothing in the guild can report this run.
+	if state.tokenDead {
+		return e.openDMSurface(ctx, j, state, startComponents...)
+	}
+	return false
+}
+
+// Opens the DM first and only then rewrites the channel message, so the signpost is never a
+// promise of a DM that did not arrive.
+func (e *Engine) handOverBeforeTokenExpiry(ctx context.Context, j *job.PurgeJob, state *execState, target, status string) {
+	opened := e.openDMSurface(ctx, j, state, e.inProgressComponents(j, target, status, true)...)
+	// Not yet refused, so do not publish an unreachable notice the dead token could never
+	// correct; the next tick retries while the token still lives.
+	if !opened && !state.dmDenied && j.RequestedByID != 0 {
+		return
+	}
+
+	notice := locale.MsgPurgeHandoverUnreachable.In(j.Locale, discord.UserMention(snowflake.ID(j.RequestedByID)))
+	if opened {
+		notice = locale.MsgPurgeHandoverToDM.In(j.Locale, discord.UserMention(snowflake.ID(j.RequestedByID)))
+	}
+	if _, err := e.client.Rest.UpdateInteractionResponse(
+		snowflake.ID(j.ApplicationID),
+		j.InteractionToken,
+		discord.NewMessageUpdateV2(discord.NewContainer(discord.NewTextDisplay(notice))),
+	); err != nil {
+		e.logger.Warn("write status handover notice", zap.Error(err))
+	}
+	state.tokenDead = true
+	e.logger.Info("handing status surface to direct message before token expiry",
+		zap.Bool("dm_opened", opened), idField("requested_by_id", j.RequestedByID))
 }

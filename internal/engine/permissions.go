@@ -14,7 +14,8 @@ import (
 )
 
 const (
-	// The set the invite asks for (permissions=74752).
+	// What a channel must grant to be purgeable. Narrower than the invite on purpose: an extra
+	// bit here skips a channel the bot could have purged.
 	requiredPurgePerms = discord.PermissionViewChannel |
 		discord.PermissionReadMessageHistory |
 		discord.PermissionManageMessages
@@ -202,6 +203,8 @@ var permissionNameTable = []struct {
 	{discord.PermissionViewChannel, "View Channel"},
 	{discord.PermissionReadMessageHistory, "Read Message History"},
 	{discord.PermissionManageMessages, "Manage Messages"},
+	{discord.PermissionSendMessages, "Send Messages"},
+	{discord.PermissionSendMessagesInThreads, "Send Messages in Threads"},
 }
 
 // discord.Permissions.String ranges a map, so its order varies between calls.

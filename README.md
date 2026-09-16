@@ -8,7 +8,8 @@ Purge worker service for PurgeBot. Consumes jobs from the Redis queue and perfor
 - Resolves the target (server, category, or channel) into a list of channels and threads
 - Fetches messages in batches and applies filters (date, content, author type)
 - Bulk-deletes messages newer than 14 days; individually deletes older ones
-- Updates the original interaction response with live progress and a cancel button
+- Keeps one live progress surface per run, moving one way only as each is refused: interaction
+  response, channel message, then a direct message to whoever started the purge
 - Records completed purge jobs to the database for stats
 
 ## Configuration
