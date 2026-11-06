@@ -11,7 +11,7 @@ require (
 	github.com/PurgeBot-net/database v0.0.0-20261105230312-0507812f0465
 	github.com/PurgeBot-net/locale v0.0.0-20261105230405-ae8e53290a12
 	github.com/caarlos0/env/v11 v11.4.1
-	github.com/disgoorg/disgo v0.19.6
+	github.com/disgoorg/disgo v0.20.0
 	github.com/disgoorg/snowflake/v2 v2.0.3
 	github.com/joho/godotenv v1.5.1
 	github.com/redis/go-redis/v9 v9.19.0
