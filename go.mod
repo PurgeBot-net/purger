@@ -2,10 +2,6 @@ module github.com/PurgeBot-net/purger
 
 go 1.26.0
 
-// replace github.com/PurgeBot-net/common => ../common
-// replace github.com/PurgeBot-net/database => ../database
-// replace github.com/PurgeBot-net/locale => ../locale
-
 require (
 	github.com/PurgeBot-net/common v0.0.0-20261109092513-bd69a0eacff1
 	github.com/PurgeBot-net/database v0.0.0-20261105230312-0507812f0465

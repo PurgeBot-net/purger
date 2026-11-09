@@ -7,8 +7,7 @@ COPY locale/   ./locale/
 COPY purger/   ./purger/
 
 WORKDIR /build/purger
-RUN sed -i 's|// replace github.com/PurgeBot-net/|replace github.com/PurgeBot-net/|g' go.mod
-RUN go mod tidy
+RUN go work init . ../common ../database ../locale
 RUN go build -o /purger ./cmd/
 
 FROM alpine:latest
