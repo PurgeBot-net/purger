@@ -7,9 +7,9 @@ go 1.26.0
 // replace github.com/PurgeBot-net/locale => ../locale
 
 require (
-	github.com/PurgeBot-net/common v0.0.0-20261107003128-531153fbfeaa
+	github.com/PurgeBot-net/common v0.0.0-20261109092513-bd69a0eacff1
 	github.com/PurgeBot-net/database v0.0.0-20261105230312-0507812f0465
-	github.com/PurgeBot-net/locale v0.0.0-20261105230405-ae8e53290a12
+	github.com/PurgeBot-net/locale v0.0.0-20261109092453-5412010d09a4
 	github.com/caarlos0/env/v11 v11.4.1
 	github.com/disgoorg/disgo v0.20.0
 	github.com/disgoorg/snowflake/v2 v2.0.3

@@ -129,7 +129,8 @@ func (w *Worker) loop(ctx context.Context) {
 		)
 
 		eng := engine.New(w.cfg, jobLog, w.db, w.redis, w.client)
-		err = eng.Execute(ctx, j)
+		// The active key is authoritative; a queued copy re-marshalled by an older build can lack fields.
+		err = eng.Execute(ctx, active)
 		// Not deferred: extracting a function to reach one would drag the cleanup
 		// below into the interrupt path, which must skip it.
 		running = w.running.Add(-1)

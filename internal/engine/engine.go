@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"iter"
 	"regexp"
 	"slices"
 	"strconv"
@@ -890,6 +891,7 @@ func (e *Engine) Execute(ctx context.Context, j *job.PurgeJob) error {
 		zap.String("filter_mode", string(j.FilterMode)),
 		zap.Int("filter_len", len(j.Filter)),
 		zap.Bool("filter_keep", j.FilterKeep),
+		zap.Bool("flagged_media", j.FlaggedMedia),
 		zap.Bool("case_sensitive", j.CaseSensitive),
 		zap.Bool("include_threads", j.IncludeThreads),
 		zap.Bool("include_bots", j.IncludeBots),
@@ -993,7 +995,16 @@ func (e *Engine) Execute(ctx context.Context, j *job.PurgeJob) error {
 			inFlight.Store(ch.ChannelID, true)
 			defer inFlight.Delete(ch.ChannelID)
 
-			err := e.purgeChannel(gctx, j, state, ch)
+			err := func() (err error) {
+				// A disgo decode panic would crash the worker, and job recovery would replay it on every restart.
+				defer func() {
+					if r := recover(); r != nil {
+						e.logger.Error("channel purge panicked", idField("channel_id", ch.ChannelID), zap.Any("panic", r), zap.Stack("stack"))
+						err = errors.New(locale.MsgErrorInternal.In(j.Locale))
+					}
+				}()
+				return e.purgeChannel(gctx, j, state, ch)
+			}()
 			// Only these abort the job. A channel that simply failed is recorded and
 			// the rest carry on, exactly as when channels ran one at a time.
 			if errors.Is(err, ErrCancelled) || errors.Is(err, ErrInterrupted) {
@@ -1413,6 +1424,10 @@ func isDeletedAccount(u discord.User) bool {
 // Author.Bot cannot separate the two and a membership lookup always comes back
 // absent. Every branch below states what it does with fromWebhook.
 func (e *Engine) matchesJob(ctx context.Context, j *job.PurgeJob, msg discord.Message, state *execState) bool {
+	// filter_keep never inverts this check.
+	if j.FlaggedMedia && !messageHasFlaggedMedia(msg) {
+		return false
+	}
 	guildID := snowflake.ID(j.GuildID)
 	fromWebhook := authorIsWebhook(msg)
 
@@ -1500,6 +1515,50 @@ func filterTargets(msg discord.Message) []string {
 		targets = appendAttachmentTargets(targets, snap.Message.Attachments)
 	}
 	return targets
+}
+
+const (
+	flaggedAttachment = discord.AttachmentFlagContainsExplicitContent | discord.AttachmentFlagContainsGoreContent | discord.AttachmentFlagContainsSelfHarmContent
+	flaggedEmbed      = discord.EmbedFlagContainsExplicitContent | discord.EmbedFlagContainsGoreContent | discord.EmbedFlagContainsSelfHarmContent
+	flaggedScan       = discord.UnfurledMediaItemContentScanMetadataFlagIsExplicitContent | discord.UnfurledMediaItemContentScanMetadataFlagIsGoreContent | discord.UnfurledMediaItemContentScanMetadataFlagIsSelfHarmContent
+)
+
+func messageHasFlaggedMedia(msg discord.Message) bool {
+	if hasFlaggedMedia(msg.Attachments, msg.Embeds, msg.AllComponents()) {
+		return true
+	}
+	return slices.ContainsFunc(msg.MessageSnapshots, func(s discord.MessageSnapshot) bool {
+		return hasFlaggedMedia(s.Message.Attachments, s.Message.Embeds, s.Message.AllComponents())
+	})
+}
+
+// Attachments omits uploads that components reference, so a Components V2 file is only flagged on its media item.
+func hasFlaggedMedia(atts []discord.Attachment, embeds []discord.Embed, components iter.Seq[discord.Component]) bool {
+	if slices.ContainsFunc(atts, func(a discord.Attachment) bool { return a.Flags&flaggedAttachment != 0 }) ||
+		slices.ContainsFunc(embeds, func(em discord.Embed) bool { return em.Flags&flaggedEmbed != 0 }) {
+		return true
+	}
+	for c := range components {
+		switch c := c.(type) {
+		case discord.ThumbnailComponent:
+			if mediaFlagged(c.Media) {
+				return true
+			}
+		case discord.FileComponent:
+			if mediaFlagged(c.File) {
+				return true
+			}
+		case discord.MediaGalleryComponent:
+			if slices.ContainsFunc(c.Items, func(it discord.MediaGalleryItem) bool { return mediaFlagged(it.Media) }) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func mediaFlagged(m discord.UnfurledMediaItem) bool {
+	return m.ContentScanMetadata != nil && m.ContentScanMetadata.Flags&flaggedScan != 0
 }
 
 func (e *Engine) matchesFilter(j *job.PurgeJob, msg discord.Message, state *execState) bool {
@@ -1626,6 +1685,15 @@ func (e *Engine) sendCompletion(ctx context.Context, j *job.PurgeJob, state *exe
 
 	if lines := skippedChannelLines(results, j.Locale); len(lines) > 0 {
 		texts = append(texts, discord.NewTextDisplay(locale.MsgPurgeCompleteSkippedChannels.In(j.Locale, strings.Join(lines, "\n"))))
+	}
+
+	// Get Guild Channels omits channels the bot can't view, so no line above can name them.
+	if j.TargetType != job.TargetTypeChannel {
+		guildID := snowflake.ID(j.GuildID)
+		if perms := state.botPermissions(ctx, e, guildID); !perms.ok ||
+			!botGuildPermissions(guildID, perms.roleIDs, perms.rolePerms).Has(discord.PermissionAdministrator) {
+			texts = append(texts, discord.NewTextDisplay(locale.MsgPurgeCompleteHiddenChannels.In(j.Locale)))
+		}
 	}
 
 	if showBranding {

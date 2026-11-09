@@ -132,7 +132,12 @@ func (e *Engine) missingPermissionsForChannel(ctx context.Context, state *execSt
 
 	base := botGuildPermissions(guildID, bot.roleIDs, bot.rolePerms)
 	have := botChannelPermissions(base, guildID, snowflake.ID(e.cfg.ApplicationID), bot.roleIDs, overwrites)
-	return missingForChannel(have)
+	missing := missingForChannel(have)
+	// Get Channel Messages also needs Connect in a voice channel and answers 50001 without it.
+	if gc.Type() == discord.ChannelTypeGuildVoice && !have.Has(discord.PermissionConnect) {
+		missing |= discord.PermissionConnect
+	}
+	return missing
 }
 
 func channelTypeIsThread(t discord.ChannelType) bool {
@@ -203,6 +208,7 @@ var permissionNameTable = []struct {
 	{discord.PermissionViewChannel, "View Channel"},
 	{discord.PermissionReadMessageHistory, "Read Message History"},
 	{discord.PermissionManageMessages, "Manage Messages"},
+	{discord.PermissionConnect, "Connect"},
 	{discord.PermissionSendMessages, "Send Messages"},
 	{discord.PermissionSendMessagesInThreads, "Send Messages in Threads"},
 }
