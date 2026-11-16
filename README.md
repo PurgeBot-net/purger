@@ -10,7 +10,7 @@ Purge worker service for PurgeBot. Consumes jobs from the Redis queue and perfor
 - Bulk-deletes messages newer than 14 days; individually deletes older ones
 - Keeps one live progress surface per run, moving one way only as each is refused: interaction
   response, channel message, then a direct message to whoever started the purge
-- Records completed purge jobs to the database for stats
+- Records completed purge jobs to the database for stats, unless the server turned stats off with `/settings`
 
 ## Configuration
 
