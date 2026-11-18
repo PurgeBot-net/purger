@@ -24,6 +24,6 @@ All configuration is loaded from environment variables (see `.env.example` in th
 | `REDIS_ADDR`, `REDIS_PASSWORD`, `REDIS_DB` | Redis connection                                                                   |
 | `WORKER_CONCURRENCY`                       | Purge workers to run in parallel (default `4`)                                     |
 | `PURGE_CHANNEL_CONCURRENCY`                | Channels of one purge to delete from at once, `0` for every channel (default `10`) |
-| `SENTRY_DSN`                               | Sentry error reporting (optional)                                                  |
+| `SENTRY_DSN`                               | Sentry-compatible error reporting (optional)                                       |
 | `LOG_LEVEL`                                | `debug`, `info`, `warn`, `error`                                                   |
 | `LOG_JSON`                                 | `true` for JSON log output                                                         |
