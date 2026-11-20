@@ -424,7 +424,7 @@ func (e *Engine) adoptInteractionResponseTarget(ctx context.Context, j *job.Purg
 		e.logger.Warn("fetch interaction response for status target", zap.Error(err))
 		return
 	}
-	if msg.ID != 0 {
+	if msg.ID != 0 && !msg.Flags.Has(discord.MessageFlagEphemeral) {
 		state.commandMessageID = msg.ID
 		state.exclude(msg.ID)
 	}
@@ -1115,6 +1115,14 @@ func inFlightNames(order []uint64, inFlight *sync.Map) string {
 	return strings.Join(names, ", ")
 }
 
+func purgeableChannelType(t discord.ChannelType) bool {
+	switch t {
+	case discord.ChannelTypeGuildText, discord.ChannelTypeGuildNews, discord.ChannelTypeGuildVoice, discord.ChannelTypeGuildForum:
+		return true
+	}
+	return false
+}
+
 // resolveChannels returns the ordered list of channel (and thread) IDs to purge.
 func (e *Engine) resolveChannels(ctx context.Context, j *job.PurgeJob) ([]uint64, error) {
 	skipSet := make(map[uint64]bool, len(j.SkipChannelIDs))
@@ -1124,6 +1132,14 @@ func (e *Engine) resolveChannels(ctx context.Context, j *job.PurgeJob) ([]uint64
 
 	switch j.TargetType {
 	case job.TargetTypeChannel:
+		// The target is typed by the user, so it can name a channel in any server the bot is in.
+		ch, err := e.client.Rest.GetChannel(snowflake.ID(j.TargetID), rest.WithCtx(ctx))
+		if err != nil {
+			return nil, fmt.Errorf("fetch channel: %w", err)
+		}
+		if gc, ok := ch.(discord.GuildChannel); !ok || uint64(gc.GuildID()) != j.GuildID || !purgeableChannelType(gc.Type()) {
+			return nil, fmt.Errorf("channel %d is not a purgeable channel in this server", j.TargetID)
+		}
 		result := []uint64{j.TargetID}
 		if j.IncludeThreads {
 			threads := e.fetchThreadsForChannels(ctx, j.GuildID, result)
@@ -1825,8 +1841,9 @@ func (e *Engine) updateComponents(ctx context.Context, j *job.PurgeJob, state *e
 			e.logger.Info("status message edit cap reached, replacing message", append(target, zap.Error(err))...)
 			state.staleChannelID, state.staleMessageID = state.fallbackChannelID, state.fallbackMessageID
 			e.clearStatusTarget(ctx, state)
-		case statusChannelUnavailable(err) && toDM:
+		case (statusChannelUnavailable(err) || dmDeliveryRefused(err)) && toDM:
 			state.dmChannelID = 0
+			state.dmDenied = state.dmDenied || dmDeliveryRefused(err)
 			e.logger.Info("direct message surface unavailable, falling back", append(target, zap.Error(err))...)
 			e.clearStatusTarget(ctx, state)
 		case statusChannelUnavailable(err):
@@ -1980,7 +1997,7 @@ func (e *Engine) openStatusSurface(ctx context.Context, j *job.PurgeJob, state *
 	default:
 		msg, err := e.client.Rest.GetInteractionResponse(snowflake.ID(j.ApplicationID), j.InteractionToken)
 		if err == nil {
-			if msg.ID != 0 {
+			if msg.ID != 0 && !msg.Flags.Has(discord.MessageFlagEphemeral) {
 				state.commandMessageID = msg.ID
 				state.exclude(msg.ID)
 			}
