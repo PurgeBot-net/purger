@@ -232,8 +232,8 @@ func permissionNames(p discord.Permissions) string {
 const (
 	maxSkippedGroups   = 10
 	maxSkippedMentions = 20
-	maxSkippedReason = 200
-	maxSkippedChars  = 2000
+	maxSkippedReason   = 200
+	maxSkippedChars    = 2000
 )
 
 // Grouped and capped: Discord refuses an oversized components-v2 message, and updateComponents

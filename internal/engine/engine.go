@@ -179,7 +179,7 @@ func memberLookupSaysAbsent(err error) bool {
 // rest of the run. The REST call runs unlocked so a slow lookup does not block
 // cache hits in the other channels; a duplicated lookup is harmless, and disgo
 // serialises them anyway because the bucket is keyed on the guild.
-func (s *execState) lookupMember(ctx context.Context, e *Engine, guildID, userID snowflake.ID) ([]snowflake.ID, memberStatus) {
+func (s *execState) lookupMember(e *Engine, guildID, userID snowflake.ID) ([]snowflake.ID, memberStatus) {
 	s.membersMu.RLock()
 	cached, ok := s.members[userID]
 	s.membersMu.RUnlock()
@@ -1142,7 +1142,7 @@ func (e *Engine) resolveChannels(ctx context.Context, j *job.PurgeJob) ([]uint64
 		}
 		result := []uint64{j.TargetID}
 		if j.IncludeThreads {
-			threads := e.fetchThreadsForChannels(ctx, j.GuildID, result)
+			threads := e.fetchThreadsForChannels(j.GuildID, result)
 			result = append(result, threads...)
 		}
 		return result, nil
@@ -1172,10 +1172,10 @@ func (e *Engine) resolveChannels(ctx context.Context, j *job.PurgeJob) ([]uint64
 		}
 		// Forum threads are always included (the forum channel itself has no messages).
 		if len(forumIDs) > 0 {
-			result = append(result, e.fetchThreadsForChannels(ctx, j.GuildID, forumIDs)...)
+			result = append(result, e.fetchThreadsForChannels(j.GuildID, forumIDs)...)
 		}
 		if j.IncludeThreads && len(textThreadParents) > 0 {
-			result = append(result, e.fetchThreadsForChannels(ctx, j.GuildID, textThreadParents)...)
+			result = append(result, e.fetchThreadsForChannels(j.GuildID, textThreadParents)...)
 		}
 		return result, nil
 
@@ -1200,10 +1200,10 @@ func (e *Engine) resolveChannels(ctx context.Context, j *job.PurgeJob) ([]uint64
 			}
 		}
 		if len(forumIDs) > 0 {
-			result = append(result, e.fetchThreadsForChannels(ctx, j.GuildID, forumIDs)...)
+			result = append(result, e.fetchThreadsForChannels(j.GuildID, forumIDs)...)
 		}
 		if j.IncludeThreads && len(textThreadParents) > 0 {
-			result = append(result, e.fetchThreadsForChannels(ctx, j.GuildID, textThreadParents)...)
+			result = append(result, e.fetchThreadsForChannels(j.GuildID, textThreadParents)...)
 		}
 		return result, nil
 
@@ -1213,7 +1213,7 @@ func (e *Engine) resolveChannels(ctx context.Context, j *job.PurgeJob) ([]uint64
 }
 
 // fetchThreadsForChannels returns active and archived thread IDs whose parent is in parentIDs.
-func (e *Engine) fetchThreadsForChannels(ctx context.Context, guildID uint64, parentIDs []uint64) []uint64 {
+func (e *Engine) fetchThreadsForChannels(guildID uint64, parentIDs []uint64) []uint64 {
 	parentSet := make(map[uint64]bool, len(parentIDs))
 	for _, id := range parentIDs {
 		parentSet[id] = true
@@ -1363,7 +1363,7 @@ func (e *Engine) purgeChannel(ctx context.Context, j *job.PurgeJob, state *execS
 			if !msg.Type.Deleteable() {
 				continue
 			}
-			if !e.matchesJob(ctx, j, msg, state) {
+			if !e.matchesJob(j, msg, state) {
 				continue
 			}
 			if time.Since(msg.CreatedAt) < bulkDeleteMaxAge {
@@ -1411,7 +1411,7 @@ func (e *Engine) purgeChannel(ctx context.Context, j *job.PurgeJob, state *execS
 // Interaction replies arrive as webhook messages whose webhook ID is the
 // application's own, so they otherwise look like webhook posts.
 func isInteractionResponse(msg discord.Message) bool {
-	if msg.InteractionMetadata != nil || msg.Interaction != nil {
+	if msg.InteractionMetadata != nil || msg.Interaction != nil { //nolint:staticcheck // Some older replies carry only the legacy field.
 		return true
 	}
 	// Replies predating interaction_metadata carry neither field.
@@ -1437,7 +1437,7 @@ func isDeletedAccount(u discord.User) bool {
 // Discord makes a webhook post's author the webhook and flags it as a bot, so
 // Author.Bot cannot separate the two and a membership lookup always comes back
 // absent. Every branch below states what it does with fromWebhook.
-func (e *Engine) matchesJob(ctx context.Context, j *job.PurgeJob, msg discord.Message, state *execState) bool {
+func (e *Engine) matchesJob(j *job.PurgeJob, msg discord.Message, state *execState) bool {
 	// filter_keep never inverts this check.
 	if j.FlaggedMedia && !messageHasFlaggedMedia(msg) {
 		return false
@@ -1458,7 +1458,7 @@ func (e *Engine) matchesJob(ctx context.Context, j *job.PurgeJob, msg discord.Me
 		if !j.IncludeBots && msg.Author.Bot {
 			return false
 		}
-		roles, status := state.lookupMember(ctx, e, guildID, msg.Author.ID)
+		roles, status := state.lookupMember(e, guildID, msg.Author.ID)
 		if status != memberStatusPresent {
 			return false
 		}
@@ -1485,7 +1485,7 @@ func (e *Engine) matchesJob(ctx context.Context, j *job.PurgeJob, msg discord.Me
 		if !j.IncludeBots && msg.Author.Bot {
 			return false
 		}
-		if _, status := state.lookupMember(ctx, e, guildID, msg.Author.ID); status != memberStatusAbsent {
+		if _, status := state.lookupMember(e, guildID, msg.Author.ID); status != memberStatusAbsent {
 			return false
 		}
 
@@ -1585,12 +1585,7 @@ func (e *Engine) matchesFilter(j *job.PurgeJob, msg discord.Message, state *exec
 		if state.filterRegex == nil {
 			return false
 		}
-		for _, target := range targets {
-			if state.filterRegex.MatchString(target) {
-				return true
-			}
-		}
-		return false
+		return slices.ContainsFunc(targets, state.filterRegex.MatchString)
 	}
 
 	filter := j.Filter
@@ -1669,7 +1664,7 @@ func (e *Engine) inProgressComponents(j *job.PurgeJob, target, status string, wi
 }
 
 func (e *Engine) sendInProgress(ctx context.Context, j *job.PurgeJob, state *execState, target, status string, withCancel bool) {
-	e.updateComponents(ctx, j, state, e.inProgressComponents(j, target, status, withCancel)...)
+	_ = e.updateComponents(ctx, j, state, e.inProgressComponents(j, target, status, withCancel)...)
 }
 
 func (e *Engine) sendCancelled(ctx context.Context, j *job.PurgeJob, state *execState, totalDeleted int, showBranding bool) {
@@ -1799,7 +1794,7 @@ func notStartedText(j *job.PurgeJob, reason string) string {
 }
 
 func (e *Engine) updateText(ctx context.Context, j *job.PurgeJob, state *execState, text string) {
-	e.updateComponents(ctx, j, state, discord.NewContainer(discord.NewTextDisplay(text)))
+	_ = e.updateComponents(ctx, j, state, discord.NewContainer(discord.NewTextDisplay(text)))
 }
 
 // One surface at a time, moving one way only:

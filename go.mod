@@ -3,8 +3,8 @@ module github.com/PurgeBot-net/purger
 go 1.26.0
 
 require (
-	github.com/PurgeBot-net/common v0.0.0-20261118220938-db1a61592ba3
-	github.com/PurgeBot-net/database v0.0.0-20261120194413-e921b5799573
+	github.com/PurgeBot-net/common v0.0.0-20261120233241-bfe91dc1ecab
+	github.com/PurgeBot-net/database v0.0.0-20261120233237-09c2bbfdfb87
 	github.com/PurgeBot-net/locale v0.0.0-20261120223011-0b98f6115af7
 	github.com/caarlos0/env/v11 v11.4.1
 	github.com/disgoorg/disgo v0.20.0

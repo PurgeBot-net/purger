@@ -28,7 +28,7 @@ func main() {
 		panic("create logger: " + err.Error())
 	}
 	logger = log.WithSentry(logger, cfg.SentryDSN)
-	defer logger.Sync()
+	defer func() { _ = logger.Sync() }()
 
 	// cfg.DatabaseURL() is never logged: it embeds the password.
 	logger.Info("purger starting",
@@ -62,7 +62,7 @@ func main() {
 	if err != nil {
 		logger.Fatal("connect redis", zap.Error(err), zap.String("addr", cfg.RedisAddr), zap.Int("db", cfg.RedisDB))
 	}
-	defer redis.Close()
+	defer func() { _ = redis.Close() }()
 
 	w, err := worker.New(cfg, logger, db, redis)
 	if err != nil {

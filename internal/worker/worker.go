@@ -57,10 +57,7 @@ func idField(key string, id uint64) zap.Field {
 func (w *Worker) Run(ctx context.Context) {
 	w.recoverActiveJobs(ctx)
 
-	concurrency := w.cfg.WorkerConcurrency
-	if concurrency < 1 {
-		concurrency = 1
-	}
+	concurrency := max(w.cfg.WorkerConcurrency, 1)
 	w.logger.Info("purge worker started",
 		zap.Int("concurrency", concurrency),
 		zap.Int("channel_concurrency", w.cfg.ChannelConcurrency),
@@ -68,11 +65,7 @@ func (w *Worker) Run(ctx context.Context) {
 
 	var wg sync.WaitGroup
 	for range concurrency {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			w.loop(ctx)
-		}()
+		wg.Go(func() { w.loop(ctx) })
 	}
 	wg.Wait()
 	w.logger.Info("purge worker stopped", zap.Int64("running", w.running.Load()))
