@@ -11,6 +11,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/disgoorg/disgo/bot"
 	"github.com/disgoorg/disgo/discord"
@@ -377,39 +378,31 @@ func shouldHandOverBeforeTokenExpiry(createdAt, now time.Time, onWebhook, channe
 
 // A button in a DM reaches HandleCancel, which answers with UpdateMessage and would clobber the
 // surface the status ticker is editing, so the row is replaced by a hint naming /cancel.
+// The header sits above the card so the card reads as it does in the channel.
 func dmComponents(components []discord.LayoutComponent, header, hint string) []discord.LayoutComponent {
-	out := make([]discord.LayoutComponent, 0, len(components))
+	out := make([]discord.LayoutComponent, 0, len(components)+1)
 	droppedRow := false
-	headered := false
+	lastCard := -1
 	for _, c := range components {
-		container, ok := c.(discord.ContainerComponent)
-		if !ok {
-			if _, isRow := c.(discord.ActionRowComponent); isRow {
-				droppedRow = true
-				continue
-			}
-			out = append(out, c)
+		if _, isRow := c.(discord.ActionRowComponent); isRow {
+			droppedRow = true
 			continue
 		}
-		if !headered {
-			subs := make([]discord.ContainerSubComponent, 0, len(container.Components)+2)
-			subs = append(subs, discord.NewTextDisplay(header))
-			container.Components = append(subs, container.Components...)
-			headered = true
+		if _, isCard := c.(discord.ContainerComponent); isCard {
+			lastCard = len(out)
 		}
-		out = append(out, container)
+		out = append(out, c)
 	}
-	if !droppedRow || !headered {
+	if lastCard < 0 {
 		return out
 	}
-	for i := len(out) - 1; i >= 0; i-- {
-		if container, ok := out[i].(discord.ContainerComponent); ok {
-			container.Components = append(container.Components, discord.NewTextDisplay(hint))
-			out[i] = container
-			break
-		}
+	if droppedRow {
+		card := out[lastCard].(discord.ContainerComponent)
+		// A fresh slice: appending to card.Components could write into the caller's backing array.
+		card.Components = append(slices.Clip(card.Components), discord.NewTextDisplay(hint))
+		out[lastCard] = card
 	}
-	return out
+	return append([]discord.LayoutComponent{discord.NewTextDisplay(header)}, out...)
 }
 
 // No context parameter: a rest.WithCtx here would cancel the completion message at shutdown.
@@ -815,7 +808,7 @@ func (e *Engine) Execute(ctx context.Context, j *job.PurgeJob) error {
 	}
 
 	if stateErr != nil {
-		e.updateText(ctx, j, state, fmt.Sprintf("❌ %s", stateErr.Error()))
+		e.updateText(ctx, j, state, notStartedText(j, stateErr.Error()))
 		return fmt.Errorf("compile filter: %w", stateErr)
 	}
 	commandMsgID := state.commandMessageID
@@ -827,7 +820,7 @@ func (e *Engine) Execute(ctx context.Context, j *job.PurgeJob) error {
 	if progress == nil {
 		channels, err := e.resolveChannels(ctx, j)
 		if err != nil {
-			e.updateText(ctx, j, state, locale.MsgPurgeResolveError.In(j.Locale, err.Error()))
+			e.updateText(ctx, j, state, notStartedText(j, locale.MsgPurgeResolveError.In(j.Locale, err.Error())))
 			return fmt.Errorf("resolve channels: %w", err)
 		}
 		cutoff := time.Time{}
@@ -1107,10 +1100,15 @@ func (e *Engine) logOutcome(outcome string, j *job.PurgeJob, state *execState, s
 }
 
 // Resolve order, so the status message does not reorder as channels finish.
+// Capped: PURGE_CHANNEL_CONCURRENCY=0 can put every channel in flight, past Discord's text limit.
 func inFlightNames(order []uint64, inFlight *sync.Map) string {
-	names := make([]string, 0, len(order))
+	names := make([]string, 0, min(len(order), maxInFlightNames+1))
 	for _, id := range order {
 		if _, ok := inFlight.Load(id); ok {
+			if len(names) == maxInFlightNames {
+				names = append(names, "...")
+				break
+			}
 			names = append(names, fmt.Sprintf("<#%d>", id))
 		}
 	}
@@ -1389,7 +1387,7 @@ func (e *Engine) purgeChannel(ctx context.Context, j *job.PurgeJob, state *execS
 			zap.Int("unresolved", unresolved),
 			zap.Int("deleted", ch.Deleted),
 		)
-		return fmt.Errorf("%d message(s) could not be deleted", unresolved)
+		return fmt.Errorf("%s", locale.MsgPurgeCompleteUndeleted.In(j.Locale, unresolved))
 	}
 	return nil
 }
@@ -1612,6 +1610,19 @@ func (e *Engine) matchesFilter(j *job.PurgeJob, msg discord.Message, state *exec
 
 // ── UI helpers ────────────────────────────────────────────────────────────────
 
+const (
+	// Discord refuses a components-v2 message whose text displays total over 4000 characters.
+	maxNotStartedReason = 1000
+	maxInFlightNames    = 25
+)
+
+func truncate(s string, max int) string {
+	if utf8.RuneCountInString(s) <= max {
+		return s
+	}
+	return string([]rune(s)[:max-1]) + "…"
+}
+
 func (e *Engine) targetDisplay(j *job.PurgeJob) string {
 	if j.TargetType == job.TargetTypeServer {
 		return locale.MsgTargetServer.In(j.Locale)
@@ -1625,7 +1636,6 @@ func cancelButton(j *job.PurgeJob) discord.ActionRowComponent {
 			Style:    discord.ButtonStyleDanger,
 			Label:    locale.MsgCancelButton.In(j.Locale),
 			CustomID: fmt.Sprintf("cancel:%s:%d", j.ID, j.RequestedByID),
-			Emoji:    &discord.ComponentEmoji{Name: "🛑"},
 		},
 	}}
 }
@@ -1651,11 +1661,7 @@ func (e *Engine) sendCancelled(ctx context.Context, j *job.PurgeJob, state *exec
 	if totalDeleted > 0 {
 		msg += locale.MsgPurgeCancelledCount.In(j.Locale, totalDeleted)
 	}
-	texts := []discord.ContainerSubComponent{discord.NewTextDisplay(msg)}
-	if showBranding {
-		texts = append(texts, discord.NewTextDisplay("-# Powered by PurgeBot"))
-	}
-	if err := e.deliverFinal(ctx, j, state, discord.NewContainer(texts...)); err != nil {
+	if err := e.deliverFinal(ctx, j, state, withBranding(showBranding, discord.NewContainer(discord.NewTextDisplay(msg)))...); err != nil {
 		e.logger.Error("deliver purge cancellation message",
 			append(surfaceFields(j, state), zap.Error(err))...)
 	}
@@ -1663,10 +1669,12 @@ func (e *Engine) sendCancelled(ctx context.Context, j *job.PurgeJob, state *exec
 
 func (e *Engine) sendCompletion(ctx context.Context, j *job.PurgeJob, state *execState, target string, totalDeleted int, elapsed time.Duration, results []channelResult, showBranding bool) {
 	texts := []discord.ContainerSubComponent{
-		discord.NewTextDisplay(locale.MsgPurgeCompleteHeader.In(j.Locale, target)),
-		discord.NewTextDisplay(locale.MsgPurgeCompleteTotalDeleted.In(j.Locale, totalDeleted)),
-		discord.NewTextDisplay(locale.MsgPurgeCompleteDuration.In(j.Locale, elapsed.Seconds())),
-		discord.NewTextDisplay(locale.MsgPurgeCompleteChannelsProcessed.In(j.Locale, len(results))),
+		discord.NewTextDisplay(strings.Join([]string{
+			locale.MsgPurgeCompleteHeader.In(j.Locale, target),
+			locale.MsgPurgeCompleteTotalDeleted.In(j.Locale, totalDeleted),
+			locale.MsgPurgeCompleteDuration.In(j.Locale, elapsed.Seconds()),
+			locale.MsgPurgeCompleteChannelsProcessed.In(j.Locale, len(results)),
+		}, "\n")),
 	}
 
 	var nonEmpty []channelResult
@@ -1680,11 +1688,17 @@ func (e *Engine) sendCompletion(ctx context.Context, j *job.PurgeJob, state *exe
 		for i, r := range nonEmpty {
 			lines[i] = locale.MsgPurgeCompleteChannelLine.In(j.Locale, r.name, r.deleted)
 		}
-		texts = append(texts, discord.NewTextDisplay(locale.MsgPurgeCompleteChannelBreakdown.In(j.Locale, strings.Join(lines, "\n"))))
+		texts = append(texts,
+			discord.NewSmallSeparator(),
+			discord.NewTextDisplay(locale.MsgPurgeCompleteChannelBreakdown.In(j.Locale, strings.Join(lines, "\n"))),
+		)
 	}
 
 	if lines := skippedChannelLines(results, j.Locale); len(lines) > 0 {
-		texts = append(texts, discord.NewTextDisplay(locale.MsgPurgeCompleteSkippedChannels.In(j.Locale, strings.Join(lines, "\n"))))
+		texts = append(texts,
+			discord.NewSmallSeparator(),
+			discord.NewTextDisplay(locale.MsgPurgeCompleteSkippedChannels.In(j.Locale, strings.Join(lines, "\n"))),
+		)
 	}
 
 	// Get Guild Channels omits channels the bot can't view, so no line above can name them.
@@ -1696,13 +1710,17 @@ func (e *Engine) sendCompletion(ctx context.Context, j *job.PurgeJob, state *exe
 		}
 	}
 
-	if showBranding {
-		texts = append(texts, discord.NewTextDisplay("-# Powered by PurgeBot"))
-	}
-	if err := e.deliverFinal(ctx, j, state, discord.NewContainer(texts...)); err != nil {
+	if err := e.deliverFinal(ctx, j, state, withBranding(showBranding, discord.NewContainer(texts...))...); err != nil {
 		e.logger.Error("deliver purge completion message",
 			append(surfaceFields(j, state), zap.Int("deleted", totalDeleted), zap.Error(err))...)
 	}
+}
+
+func withBranding(show bool, card discord.ContainerComponent) []discord.LayoutComponent {
+	if !show {
+		return []discord.LayoutComponent{card}
+	}
+	return []discord.LayoutComponent{card, discord.NewTextDisplay("-# Powered by PurgeBot")}
 }
 
 // For the two messages with no next tick to retry on. A rung that fails unclassified stops the
@@ -1757,6 +1775,11 @@ func (e *Engine) discardStaleStatusMessage(state *execState) {
 			idField("message_id", uint64(state.staleMessageID)), zap.Error(err))
 	}
 	state.staleChannelID, state.staleMessageID = 0, 0
+}
+
+// Go's regexp errors echo the whole pattern and disgo's carry the whole HTTP body.
+func notStartedText(j *job.PurgeJob, reason string) string {
+	return locale.MsgPurgeNotStarted.In(j.Locale, truncate(reason, maxNotStartedReason))
 }
 
 func (e *Engine) updateText(ctx context.Context, j *job.PurgeJob, state *execState, text string) {

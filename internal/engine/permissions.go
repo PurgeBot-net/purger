@@ -4,6 +4,7 @@ import (
 	"context"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/disgoorg/disgo/discord"
 	"github.com/disgoorg/disgo/rest"
@@ -231,6 +232,8 @@ func permissionNames(p discord.Permissions) string {
 const (
 	maxSkippedGroups   = 10
 	maxSkippedMentions = 20
+	maxSkippedReason = 200
+	maxSkippedChars  = 2000
 )
 
 // Grouped and capped: Discord refuses an oversized components-v2 message, and updateComponents
@@ -255,13 +258,19 @@ func skippedChannelLines(results []channelResult, lang string) []string {
 	}
 
 	lines := make([]string, 0, len(order)+1)
+	chars := 0
 	for _, reason := range order {
 		names := grouped[reason]
 		if len(names) > maxSkippedMentions {
 			// Its own entry: appended to the reason it would read as another permission name.
 			names = append(names[:maxSkippedMentions:maxSkippedMentions], "...")
 		}
-		lines = append(lines, locale.MsgPurgeCompleteSkippedLine.In(lang, strings.Join(names, " "), reason))
+		line := locale.MsgPurgeCompleteSkippedLine.In(lang, strings.Join(names, " "), truncate(reason, maxSkippedReason))
+		if chars += utf8.RuneCountInString(line) + 1; chars > maxSkippedChars {
+			truncated = true
+			break
+		}
+		lines = append(lines, line)
 	}
 	// Silently dropping the rest would report a clean run for channels that were skipped.
 	if truncated {
