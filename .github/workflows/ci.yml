@@ -4,6 +4,7 @@ on:
   push:
     branches: [main]
   pull_request:
+    types: [opened, edited, synchronize, reopened]
   workflow_dispatch:
 
 permissions:
@@ -16,9 +17,7 @@ jobs:
     uses: PurgeBot-net/workflows/.github/workflows/build-service.yml@main
     with:
       package_name: purger
-    secrets: inherit
 
   auto-label:
     if: github.event_name == 'pull_request'
     uses: PurgeBot-net/workflows/.github/workflows/auto-label.yaml@main
-    secrets: inherit
