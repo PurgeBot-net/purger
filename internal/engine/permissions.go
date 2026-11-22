@@ -11,6 +11,7 @@ import (
 	"github.com/disgoorg/snowflake/v2"
 	"go.uber.org/zap"
 
+	"github.com/PurgeBot-net/common/log"
 	"github.com/PurgeBot-net/locale"
 )
 
@@ -89,7 +90,7 @@ func (s *execState) channelOverwrites(ctx context.Context, e *Engine, channelID 
 	} else {
 		// Cached for botPermsTTL, so every thread under this parent skips the guard.
 		e.logger.Warn("look up thread parent overwrites, permission guard fails open",
-			idField("parent_channel_id", uint64(channelID)), zap.Error(err))
+			log.ID("parent_channel_id", uint64(channelID)), zap.Error(err))
 	}
 
 	s.parentMu.Lock()
@@ -109,7 +110,7 @@ func (e *Engine) missingPermissionsForChannel(ctx context.Context, state *execSt
 	ch, err := e.client.Rest.GetChannel(channelID, rest.WithCtx(ctx))
 	if err != nil {
 		e.logger.Warn("look up channel for permission check, guard fails open",
-			idField("channel_id", uint64(channelID)), zap.Error(err))
+			log.ID("channel_id", uint64(channelID)), zap.Error(err))
 		return 0
 	}
 	gc, isGuild := ch.(discord.GuildChannel)
@@ -151,7 +152,7 @@ func channelTypeIsThread(t discord.ChannelType) bool {
 }
 
 // Duplicated verbatim in interactions/internal/commands/permissions.go, like canCancel, so neither
-// service needs a common release. The tests are named identically in both so a diff shows drift.
+// service needs a common release.
 
 func botGuildPermissions(guildID snowflake.ID, botRoleIDs []snowflake.ID, rolePerms map[snowflake.ID]discord.Permissions) discord.Permissions {
 	perms := rolePerms[guildID]
@@ -285,12 +286,4 @@ func deniedPermission(err error) discord.Permissions {
 		return discord.PermissionViewChannel
 	}
 	return discord.PermissionManageMessages
-}
-
-// The fetch path had no denial predicate, so a 403 there reached the user as a raw disgo string.
-func fetchDeniedForChannel(err error) bool {
-	return rest.IsJSONErrorCode(err,
-		rest.JSONErrorCodeMissingAccess,
-		rest.JSONErrorCodeLackPermissionsToPerformAction,
-	)
 }

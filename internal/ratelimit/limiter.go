@@ -26,7 +26,7 @@ var _ rest.RateLimiter = (*Limiter)(nil)
 // Limiter keeps disgo's 429 warning off stderr: the inner limiter gets a
 // discarding logger, because its own warning goes to slog.Default() and so
 // bypasses LOG_LEVEL and LOG_JSON. Waiting out retry_after and retrying stays
-// disgo's job, unchanged.
+// disgo's job; Unlock only rewrites the headers disgo would otherwise misread.
 type Limiter struct {
 	rest.RateLimiter
 
@@ -65,6 +65,10 @@ func (l *Limiter) Unlock(endpoint *rest.CompiledEndpoint, rs *http.Response) err
 				zap.String("bucket", rs.Header.Get("X-RateLimit-Bucket")),
 				zap.String("remaining", rs.Header.Get("X-RateLimit-Remaining")),
 			)...)
+		}
+		// A global or Cloudflare 429 has no bucket, and disgo records no wait without one; it only logs the name.
+		if rs.Header.Get("X-RateLimit-Bucket") == "" {
+			rs.Header.Set("X-RateLimit-Bucket", "unknown")
 		}
 	}
 

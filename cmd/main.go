@@ -4,7 +4,6 @@ import (
 	"context"
 	"os"
 	"os/signal"
-	"strconv"
 	"syscall"
 
 	_ "github.com/joho/godotenv/autoload"
@@ -23,44 +22,44 @@ func main() {
 		panic("load config: " + err.Error())
 	}
 
-	logger, err := log.New(cfg.LogLevel, cfg.LogJSON)
+	logger, err := log.New(cfg.Log.Level, cfg.Log.JSON)
 	if err != nil {
 		panic("create logger: " + err.Error())
 	}
-	logger = log.WithSentry(logger, cfg.SentryDSN)
+	logger = log.WithSentry(logger, cfg.Log.SentryDSN)
 	defer func() { _ = logger.Sync() }()
 
-	// cfg.DatabaseURL() is never logged: it embeds the password.
+	// cfg.Database.URL() is never logged: it embeds the password.
 	logger.Info("purger starting",
-		zap.String("application_id", strconv.FormatUint(cfg.ApplicationID, 10)),
+		log.ID("application_id", cfg.ApplicationID),
 		zap.Int("worker_concurrency", cfg.WorkerConcurrency),
 		zap.Int("channel_concurrency", cfg.ChannelConcurrency),
-		zap.String("log_level", cfg.LogLevel),
-		zap.Bool("log_json", cfg.LogJSON),
-		zap.Bool("sentry", cfg.SentryDSN != ""),
-		zap.String("redis_addr", cfg.RedisAddr),
-		zap.Int("redis_db", cfg.RedisDB),
-		zap.String("database", cfg.DatabaseName),
+		zap.String("log_level", cfg.Log.Level),
+		zap.Bool("log_json", cfg.Log.JSON),
+		zap.Bool("sentry", cfg.Log.SentryDSN != ""),
+		zap.String("redis_addr", cfg.Redis.Addr),
+		zap.Int("redis_db", cfg.Redis.DB),
+		zap.String("database", cfg.Database.Name),
 	)
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
-	db, err := database.New(ctx, cfg.DatabaseURL())
+	db, err := database.New(ctx, cfg.Database.URL())
 	if err != nil {
 		logger.Fatal("connect database",
 			zap.Error(err),
-			zap.String("host", cfg.DatabaseHost),
-			zap.Int("port", cfg.DatabasePort),
-			zap.String("database", cfg.DatabaseName),
-			zap.String("user", cfg.DatabaseUser),
+			zap.String("host", cfg.Database.Host),
+			zap.Int("port", cfg.Database.Port),
+			zap.String("database", cfg.Database.Name),
+			zap.String("user", cfg.Database.User),
 		)
 	}
 	defer db.Close()
 
-	redis, err := rdb.New(cfg.RedisAddr, cfg.RedisPassword, cfg.RedisDB)
+	redis, err := rdb.New(cfg.Redis.Addr, cfg.Redis.Password, cfg.Redis.DB)
 	if err != nil {
-		logger.Fatal("connect redis", zap.Error(err), zap.String("addr", cfg.RedisAddr), zap.Int("db", cfg.RedisDB))
+		logger.Fatal("connect redis", zap.Error(err), zap.String("addr", cfg.Redis.Addr), zap.Int("db", cfg.Redis.DB))
 	}
 	defer func() { _ = redis.Close() }()
 

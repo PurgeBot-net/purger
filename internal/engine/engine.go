@@ -7,7 +7,6 @@ import (
 	"iter"
 	"regexp"
 	"slices"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -22,6 +21,7 @@ import (
 	"golang.org/x/sync/errgroup"
 
 	"github.com/PurgeBot-net/common/job"
+	"github.com/PurgeBot-net/common/log"
 	"github.com/PurgeBot-net/database"
 	"github.com/PurgeBot-net/locale"
 	"github.com/PurgeBot-net/purger/config"
@@ -35,6 +35,8 @@ const (
 	maxPagesBeforeFlush   = 20
 	cancelPollInterval    = time.Second
 	statusRefreshInterval = 5 * time.Second
+
+	archivedThreadPageSize = 100
 
 	// Past an hour Discord caps edits per message against an unpublished budget.
 	slowStatusRefreshInterval = 30 * time.Second
@@ -66,11 +68,6 @@ type Engine struct {
 // logger already carries job_id and guild_id: worker.go builds one Engine per job.
 func New(cfg config.Config, logger *zap.Logger, db *database.Database, redis *redis.Client, client *bot.Client) *Engine {
 	return &Engine{cfg: cfg, logger: logger, db: db, redis: redis, client: client}
-}
-
-// Snowflakes exceed 2^53, so a JSON reader using float64 corrupts them as numbers.
-func idField(key string, id uint64) zap.Field {
-	return zap.String(key, strconv.FormatUint(id, 10))
 }
 
 // A failed lookup must stay distinguishable from a confirmed absence, because
@@ -190,7 +187,7 @@ func (s *execState) lookupMember(e *Engine, guildID, userID snowflake.ID) ([]sno
 	if err != nil {
 		if !memberLookupSaysAbsent(err) {
 			// Unknown counts as "no match", so an inactive purge keeps the message.
-			e.logger.Warn("look up guild member", idField("user_id", uint64(userID)), zap.Error(err))
+			e.logger.Warn("look up guild member", log.ID("user_id", uint64(userID)), zap.Error(err))
 			return nil, memberStatusUnknown
 		}
 		s.storeMember(userID, memberLookup{status: memberStatusAbsent})
@@ -424,10 +421,7 @@ func (e *Engine) adoptInteractionResponseTarget(ctx context.Context, j *job.Purg
 		e.logger.Warn("fetch interaction response for status target", zap.Error(err))
 		return
 	}
-	if msg.ID != 0 && !msg.Flags.Has(discord.MessageFlagEphemeral) {
-		state.commandMessageID = msg.ID
-		state.exclude(msg.ID)
-	}
+	state.adoptCommandMessage(msg)
 	// Re-adopting a refused channel makes every later webhook edit adopt it again: a 403 a tick.
 	if state.channelDenied {
 		return
@@ -437,22 +431,23 @@ func (e *Engine) adoptInteractionResponseTarget(ctx context.Context, j *job.Purg
 	}
 }
 
+func (s *execState) adoptCommandMessage(msg *discord.Message) {
+	if msg.ID != 0 && !msg.Flags.Has(discord.MessageFlagEphemeral) {
+		s.commandMessageID = msg.ID
+		s.exclude(msg.ID)
+	}
+}
+
+// Only called from the channel rung, so the deferred reply sits in j.InteractionChannelID.
 func (e *Engine) dismissStaleInteractionMessage(j *job.PurgeJob, state *execState, newMessageID snowflake.ID) {
 	if state.commandMessageID == 0 || state.commandMessageID == newMessageID {
 		return
 	}
-	// The deferred reply lives in the invoking channel; fallbackChannelID may now be a DM.
 	channelID := snowflake.ID(j.InteractionChannelID)
-	if channelID == 0 && !statusSurfaceIsDM(state.fallbackChannelID, j.InteractionChannelID) {
-		channelID = state.fallbackChannelID
-	}
-	if channelID == 0 {
-		return
-	}
 	if err := e.client.Rest.DeleteMessage(channelID, state.commandMessageID); err != nil {
 		e.logger.Warn("delete stale interaction status message",
-			idField("channel_id", uint64(channelID)),
-			idField("message_id", uint64(state.commandMessageID)),
+			log.ID("channel_id", uint64(channelID)),
+			log.ID("message_id", uint64(state.commandMessageID)),
 			zap.Error(err),
 		)
 	}
@@ -559,7 +554,7 @@ func abortedDuring(ctx context.Context, err error) error {
 
 // These reject every other message in the channel too, so per-message retries
 // would be pointless.
-func deleteDeniedForChannel(err error) bool {
+func deniedForChannel(err error) bool {
 	return rest.IsJSONErrorCode(err,
 		rest.JSONErrorCodeMissingAccess,
 		rest.JSONErrorCodeLackPermissionsToPerformAction,
@@ -635,8 +630,8 @@ func (e *Engine) settlePendingDeletes(ctx context.Context, state *execState, ch 
 			return 0, reason
 		} else {
 			e.logger.Warn("check pending deleted message",
-				idField("channel_id", channelID),
-				idField("message_id", rawID),
+				log.ID("channel_id", channelID),
+				log.ID("message_id", rawID),
 				zap.Int("pending", len(ch.PendingDeleteIDs)),
 				zap.Error(err),
 			)
@@ -660,15 +655,16 @@ func (e *Engine) settlePendingDeletes(ctx context.Context, state *execState, ch 
 		switch {
 		case err == nil || rest.IsJSONErrorCode(err, rest.JSONErrorCodeUnknownMessage):
 			e.commit(ctx, state, func() { addDeleted(state.progress, ch, 1) })
-		case deleteDeniedForChannel(err):
+		case deniedForChannel(err):
 			e.commit(ctx, state, func() { clearPendingDeletes(ch) })
+			missing := permissionNames(deniedPermission(err))
 			e.logger.Warn("pending delete denied",
-				idField("channel_id", channelID),
-				idField("message_id", uint64(id)),
-				zap.String("missing_permissions", permissionNames(deniedPermission(err))),
+				log.ID("channel_id", channelID),
+				log.ID("message_id", uint64(id)),
+				zap.String("missing_permissions", missing),
 				zap.Error(err),
 			)
-			return unresolved, fmt.Errorf("%s", locale.MsgPurgeMissingPerms.In(state.lang, permissionNames(deniedPermission(err))))
+			return unresolved, fmt.Errorf("%s", locale.MsgPurgeMissingPerms.In(state.lang, missing))
 		default:
 			if reason := abortedDuring(ctx, err); reason != nil {
 				e.commit(ctx, state, nil)
@@ -676,8 +672,8 @@ func (e *Engine) settlePendingDeletes(ctx context.Context, state *execState, ch 
 			}
 			unresolved++
 			e.logger.Warn("delete pending message",
-				idField("channel_id", channelID),
-				idField("message_id", uint64(id)),
+				log.ID("channel_id", channelID),
+				log.ID("message_id", uint64(id)),
 				zap.Error(err),
 			)
 		}
@@ -713,15 +709,16 @@ func (e *Engine) deleteBatch(ctx context.Context, state *execState, ch *job.Purg
 		})
 		return 0, nil
 	}
-	if deleteDeniedForChannel(err) {
+	if deniedForChannel(err) {
 		e.commit(ctx, state, func() { clearPendingDeletes(ch) })
+		missing := permissionNames(deniedPermission(err))
 		e.logger.Warn("batch delete denied",
-			idField("channel_id", channelID),
+			log.ID("channel_id", channelID),
 			zap.Int("batch", len(batch)),
-			zap.String("missing_permissions", permissionNames(deniedPermission(err))),
+			zap.String("missing_permissions", missing),
 			zap.Error(err),
 		)
-		return 0, fmt.Errorf("%s", locale.MsgPurgeMissingPerms.In(state.lang, permissionNames(deniedPermission(err))))
+		return 0, fmt.Errorf("%s", locale.MsgPurgeMissingPerms.In(state.lang, missing))
 	}
 
 	// Neither is one bad message in the batch, so splitting it up would only multiply
@@ -733,12 +730,12 @@ func (e *Engine) deleteBatch(ctx context.Context, state *execState, ch *job.Purg
 	if ratelimit.IsTooManyRequests(err) {
 		e.commit(ctx, state, func() { clearPendingDeletes(ch) })
 		e.logger.Warn("delete still rate limited after retries",
-			idField("channel_id", channelID), zap.Int("batch", len(batch)), zap.Error(err))
+			log.ID("channel_id", channelID), zap.Int("batch", len(batch)), zap.Error(err))
 		return len(batch), nil
 	}
 
 	e.logger.Warn("delete messages, retrying individually",
-		idField("channel_id", channelID), zap.Int("batch", len(batch)), zap.Error(err))
+		log.ID("channel_id", channelID), zap.Int("batch", len(batch)), zap.Error(err))
 	return e.settlePendingDeletes(ctx, state, ch)
 }
 
@@ -789,17 +786,16 @@ func (e *Engine) Execute(ctx context.Context, j *job.PurgeJob) error {
 		msg, err := e.client.Rest.GetMessage(state.fallbackChannelID, state.fallbackMessageID)
 		if err != nil {
 			e.logger.Warn("fetch restored status message",
-				idField("channel_id", uint64(state.fallbackChannelID)),
-				idField("message_id", uint64(state.fallbackMessageID)),
+				log.ID("channel_id", uint64(state.fallbackChannelID)),
+				log.ID("message_id", uint64(state.fallbackMessageID)),
 				zap.Error(err),
 			)
 		} else if interactionResponseStillLoading(msg) {
 			e.logger.Info("restored status message still loading, re-acknowledging via interaction webhook",
-				idField("channel_id", uint64(state.fallbackChannelID)),
-				idField("message_id", uint64(state.fallbackMessageID)),
-				idField("command_message_id", progress.CommandMessageID),
+				log.ID("channel_id", uint64(state.fallbackChannelID)),
+				log.ID("message_id", uint64(state.fallbackMessageID)),
+				log.ID("command_message_id", progress.CommandMessageID),
 			)
-			state.commandMessageID = snowflake.ID(progress.CommandMessageID)
 			state.fallbackChannelID = 0
 			state.fallbackMessageID = 0
 			progress.FallbackChannelID = 0
@@ -809,7 +805,9 @@ func (e *Engine) Execute(ctx context.Context, j *job.PurgeJob) error {
 
 	if stateErr != nil {
 		e.updateText(ctx, j, state, notStartedText(j, stateErr.Error()))
-		return fmt.Errorf("compile filter: %w", stateErr)
+		// Not returned: the error echoes the user's pattern, and the worker reports errors to Sentry.
+		e.logger.Info("purge job not started, invalid regex filter", zap.Int("filter_len", len(j.Filter)))
+		return nil
 	}
 	commandMsgID := state.commandMessageID
 	fallbackChanID := state.fallbackChannelID
@@ -829,7 +827,6 @@ func (e *Engine) Execute(ctx context.Context, j *job.PurgeJob) error {
 		}
 		progress = &job.PurgeProgress{
 			JobID:             j.ID,
-			GuildID:           j.GuildID,
 			StartedAt:         start,
 			CutoffAt:          cutoff,
 			ChannelIDs:        channels,
@@ -874,8 +871,8 @@ func (e *Engine) Execute(ctx context.Context, j *job.PurgeJob) error {
 	e.logger.Info("purge job started",
 		zap.String("purge_type", string(j.PurgeType)),
 		zap.String("target_type", string(j.TargetType)),
-		idField("target_id", j.TargetID),
-		idField("requested_by_id", j.RequestedByID),
+		log.ID("target_id", j.TargetID),
+		log.ID("requested_by_id", j.RequestedByID),
 		zap.Int("channels", len(progress.ChannelIDs)),
 		zap.Bool("resumed", resumed),
 		zap.Int("already_deleted", progress.TotalDeleted),
@@ -888,17 +885,24 @@ func (e *Engine) Execute(ctx context.Context, j *job.PurgeJob) error {
 		zap.Bool("case_sensitive", j.CaseSensitive),
 		zap.Bool("include_threads", j.IncludeThreads),
 		zap.Bool("include_bots", j.IncludeBots),
-		idField("filter_user_id", j.FilterUserID),
-		idField("filter_role_id", j.FilterRoleID),
-		idField("skip_user_id", j.SkipUserID),
+		log.ID("filter_user_id", j.FilterUserID),
+		log.ID("filter_role_id", j.FilterRoleID),
+		log.ID("skip_user_id", j.SkipUserID),
 		zap.Int("skip_channels", len(j.SkipChannelIDs)),
 		zap.Int("skip_messages", len(j.SkipMessageIDs)),
 		zap.String("locale", j.Locale),
 		zap.Duration("queue_wait", start.Sub(j.CreatedAt)),
 	)
 
+	// The poller's first look comes after deletes start, so a cancel issued while queued is caught here.
+	if e.isCancelled(j.ID) {
+		e.sendCancelled(ctx, j, state, showBranding)
+		e.logOutcome("cancelled", j, state, start, resumed)
+		return ErrCancelled
+	}
+
 	if !statusJustCreated {
-		e.sendInProgress(ctx, j, state, target, locale.MsgPurgeStatusStarting.In(j.Locale), true)
+		e.sendInProgress(ctx, j, state, target, locale.MsgPurgeStatusStarting.In(j.Locale))
 	}
 
 	pending := make([]*job.PurgeChannelProgress, 0, len(progress.Channels))
@@ -978,13 +982,17 @@ func (e *Engine) Execute(ctx context.Context, j *job.PurgeJob) error {
 				if webhookRungClosed(j, state) && state.channelDenied && state.dmDenied {
 					return
 				}
-				e.sendInProgress(ctx, j, state, target, locale.MsgPurgeStatusFetching.In(j.Locale, names), true)
+				e.sendInProgress(ctx, j, state, target, locale.MsgPurgeStatusFetching.In(j.Locale, names))
 			}
 		}
 	}()
 
 	for _, ch := range pending {
 		g.Go(func() error {
+			// errgroup still runs every queued channel after an abort; one that never started has nothing to save.
+			if reason := abortReason(gctx); reason != nil {
+				return reason
+			}
 			inFlight.Store(ch.ChannelID, true)
 			defer inFlight.Delete(ch.ChannelID)
 
@@ -992,7 +1000,7 @@ func (e *Engine) Execute(ctx context.Context, j *job.PurgeJob) error {
 				// A disgo decode panic would crash the worker, and job recovery would replay it on every restart.
 				defer func() {
 					if r := recover(); r != nil {
-						e.logger.Error("channel purge panicked", idField("channel_id", ch.ChannelID), zap.Any("panic", r), zap.Stack("stack"))
+						e.logger.Error("channel purge panicked", log.ID("channel_id", ch.ChannelID), zap.Any("panic", r), zap.Stack("stack"))
 						err = errors.New(locale.MsgErrorInternal.In(j.Locale))
 					}
 				}()
@@ -1005,9 +1013,9 @@ func (e *Engine) Execute(ctx context.Context, j *job.PurgeJob) error {
 			}
 			if err != nil {
 				e.logger.Warn("channel purge failed",
-					idField("channel_id", ch.ChannelID),
+					log.ID("channel_id", ch.ChannelID),
 					zap.Int("deleted", ch.Deleted),
-					idField("scanned_to", ch.BeforeID),
+					log.ID("scanned_to", ch.BeforeID),
 					zap.Error(err),
 				)
 			}
@@ -1026,7 +1034,7 @@ func (e *Engine) Execute(ctx context.Context, j *job.PurgeJob) error {
 	workers.Wait()
 
 	if errors.Is(waitErr, ErrCancelled) {
-		e.sendCancelled(ctx, j, state, state.totalDeleted(), showBranding)
+		e.sendCancelled(ctx, j, state, showBranding)
 		e.logOutcome("cancelled", j, state, start, resumed)
 		return ErrCancelled
 	}
@@ -1037,7 +1045,7 @@ func (e *Engine) Execute(ctx context.Context, j *job.PurgeJob) error {
 	}
 
 	if e.isCancelled(j.ID) {
-		e.sendCancelled(ctx, j, state, state.totalDeleted(), showBranding)
+		e.sendCancelled(ctx, j, state, showBranding)
 		e.logOutcome("cancelled", j, state, start, resumed)
 		return ErrCancelled
 	}
@@ -1051,11 +1059,15 @@ func (e *Engine) Execute(ctx context.Context, j *job.PurgeJob) error {
 	elapsed := time.Since(progress.StartedAt)
 	results := state.results()
 
-	e.sendCompletion(ctx, j, state, target, totalDeleted, elapsed, results, showBranding)
+	// The purge is done, so a shutdown from here on must not cost it its summary or stats row.
+	tailCtx := context.WithoutCancel(ctx)
+	e.sendCompletion(tailCtx, j, state, target, totalDeleted, elapsed, results, showBranding)
 	// After delivery, so it cannot report success for a summary the user never saw.
 	e.logOutcome("completed", j, state, start, resumed)
 
-	if err := e.db.RecordPurgeEvent(ctx, database.RecordPurgeEventParams{
+	recordCtx, cancelRecord := context.WithTimeout(tailCtx, 5*time.Second)
+	defer cancelRecord()
+	if err := e.db.RecordPurgeEvent(recordCtx, database.RecordPurgeEventParams{
 		GuildID:    int64(j.GuildID),
 		PurgeType:  string(j.PurgeType),
 		TargetType: string(j.TargetType),
@@ -1125,11 +1137,7 @@ func purgeableChannelType(t discord.ChannelType) bool {
 
 // resolveChannels returns the ordered list of channel (and thread) IDs to purge.
 func (e *Engine) resolveChannels(ctx context.Context, j *job.PurgeJob) ([]uint64, error) {
-	skipSet := make(map[uint64]bool, len(j.SkipChannelIDs))
-	for _, id := range j.SkipChannelIDs {
-		skipSet[id] = true
-	}
-
+	var channels []discord.GuildChannel
 	switch j.TargetType {
 	case job.TargetTypeChannel:
 		// The target is typed by the user, so it can name a channel in any server the bot is in.
@@ -1137,79 +1145,58 @@ func (e *Engine) resolveChannels(ctx context.Context, j *job.PurgeJob) ([]uint64
 		if err != nil {
 			return nil, fmt.Errorf("fetch channel: %w", err)
 		}
-		if gc, ok := ch.(discord.GuildChannel); !ok || uint64(gc.GuildID()) != j.GuildID || !purgeableChannelType(gc.Type()) {
+		gc, ok := ch.(discord.GuildChannel)
+		if !ok || uint64(gc.GuildID()) != j.GuildID || !purgeableChannelType(gc.Type()) {
 			return nil, fmt.Errorf("channel %d is not a purgeable channel in this server", j.TargetID)
 		}
-		result := []uint64{j.TargetID}
-		if j.IncludeThreads {
-			threads := e.fetchThreadsForChannels(j.GuildID, result)
-			result = append(result, threads...)
-		}
-		return result, nil
+		channels = []discord.GuildChannel{gc}
 
-	case job.TargetTypeCategory:
-		channels, err := e.client.Rest.GetGuildChannels(snowflake.ID(j.GuildID))
+	case job.TargetTypeCategory, job.TargetTypeServer:
+		var err error
+		channels, err = e.client.Rest.GetGuildChannels(snowflake.ID(j.GuildID))
 		if err != nil {
 			return nil, fmt.Errorf("fetch channels: %w", err)
 		}
-		var result, forumIDs, textThreadParents []uint64
-		for _, ch := range channels {
-			if ch.ParentID() == nil || uint64(*ch.ParentID()) != j.TargetID {
-				continue
-			}
-			if skipSet[uint64(ch.ID())] {
-				continue
-			}
-			switch ch.Type() {
-			case discord.ChannelTypeGuildText, discord.ChannelTypeGuildNews, discord.ChannelTypeGuildVoice:
-				result = append(result, uint64(ch.ID()))
-				if ch.Type() != discord.ChannelTypeGuildVoice {
-					textThreadParents = append(textThreadParents, uint64(ch.ID()))
-				}
-			case discord.ChannelTypeGuildForum:
-				forumIDs = append(forumIDs, uint64(ch.ID()))
-			}
-		}
-		// Forum threads are always included (the forum channel itself has no messages).
-		if len(forumIDs) > 0 {
-			result = append(result, e.fetchThreadsForChannels(j.GuildID, forumIDs)...)
-		}
-		if j.IncludeThreads && len(textThreadParents) > 0 {
-			result = append(result, e.fetchThreadsForChannels(j.GuildID, textThreadParents)...)
-		}
-		return result, nil
-
-	case job.TargetTypeServer:
-		channels, err := e.client.Rest.GetGuildChannels(snowflake.ID(j.GuildID))
-		if err != nil {
-			return nil, fmt.Errorf("fetch channels: %w", err)
-		}
-		var result, forumIDs, textThreadParents []uint64
-		for _, ch := range channels {
-			if skipSet[uint64(ch.ID())] {
-				continue
-			}
-			switch ch.Type() {
-			case discord.ChannelTypeGuildText, discord.ChannelTypeGuildNews, discord.ChannelTypeGuildVoice:
-				result = append(result, uint64(ch.ID()))
-				if ch.Type() != discord.ChannelTypeGuildVoice {
-					textThreadParents = append(textThreadParents, uint64(ch.ID()))
-				}
-			case discord.ChannelTypeGuildForum:
-				forumIDs = append(forumIDs, uint64(ch.ID()))
-			}
-		}
-		if len(forumIDs) > 0 {
-			result = append(result, e.fetchThreadsForChannels(j.GuildID, forumIDs)...)
-		}
-		if j.IncludeThreads && len(textThreadParents) > 0 {
-			result = append(result, e.fetchThreadsForChannels(j.GuildID, textThreadParents)...)
-		}
-		return result, nil
 
 	default:
 		return nil, fmt.Errorf("unknown target type: %s", j.TargetType)
 	}
+
+	result, threadParents := planChannels(channels, j)
+	if len(threadParents) > 0 {
+		result = append(result, e.fetchThreadsForChannels(j.GuildID, threadParents)...)
+	}
+	return result, nil
+}
+
+func planChannels(channels []discord.GuildChannel, j *job.PurgeJob) (direct, threadParents []uint64) {
+	var forums, textParents []uint64
+	for _, ch := range channels {
+		if j.TargetType == job.TargetTypeCategory && (ch.ParentID() == nil || uint64(*ch.ParentID()) != j.TargetID) {
+			continue
+		}
+		id := uint64(ch.ID())
+		if slices.Contains(j.SkipChannelIDs, id) {
+			continue
+		}
+		switch ch.Type() {
+		case discord.ChannelTypeGuildText, discord.ChannelTypeGuildNews:
+			direct = append(direct, id)
+			textParents = append(textParents, id)
+		case discord.ChannelTypeGuildVoice:
+			direct = append(direct, id)
+		case discord.ChannelTypeGuildForum:
+			forums = append(forums, id)
+		}
+	}
+	// A forum holds only threads: always purged for a category or server, with IncludeThreads for a forum target.
+	if j.TargetType != job.TargetTypeChannel || j.IncludeThreads {
+		threadParents = forums
+	}
+	if j.IncludeThreads {
+		threadParents = append(threadParents, textParents...)
+	}
+	return direct, threadParents
 }
 
 // fetchThreadsForChannels returns active and archived thread IDs whose parent is in parentIDs.
@@ -1219,13 +1206,16 @@ func (e *Engine) fetchThreadsForChannels(guildID uint64, parentIDs []uint64) []u
 		parentSet[id] = true
 	}
 
+	// A thread listed twice would be purged by two goroutines at once.
+	seen := make(map[uint64]bool)
 	var threadIDs []uint64
 
 	active, err := e.client.Rest.GetActiveGuildThreads(snowflake.ID(guildID))
 	if err == nil {
 		for _, t := range active.Threads {
-			if parentSet[uint64(*t.ParentID())] {
-				threadIDs = append(threadIDs, uint64(t.ID()))
+			if id := uint64(t.ID()); parentSet[uint64(*t.ParentID())] && !seen[id] {
+				seen[id] = true
+				threadIDs = append(threadIDs, id)
 			}
 		}
 	} else {
@@ -1234,23 +1224,45 @@ func (e *Engine) fetchThreadsForChannels(guildID uint64, parentIDs []uint64) []u
 
 	for _, chanID := range parentIDs {
 		cid := snowflake.ID(chanID)
-		if pub, err := e.client.Rest.GetPublicArchivedThreads(cid, time.Time{}, 0); err == nil {
-			for _, t := range pub.Threads {
-				threadIDs = append(threadIDs, uint64(t.ID()))
-			}
-		} else {
-			e.logger.Warn("fetch public archived threads", idField("channel_id", chanID), zap.Error(err))
-		}
-		if priv, err := e.client.Rest.GetPrivateArchivedThreads(cid, time.Time{}, 0); err == nil {
-			for _, t := range priv.Threads {
-				threadIDs = append(threadIDs, uint64(t.ID()))
-			}
-		} else {
-			e.logger.Warn("fetch private archived threads", idField("channel_id", chanID), zap.Error(err))
-		}
+		threadIDs = e.fetchArchivedThreads(cid, e.client.Rest.GetPublicArchivedThreads, "fetch public archived threads", seen, threadIDs)
+		threadIDs = e.fetchArchivedThreads(cid, e.client.Rest.GetPrivateArchivedThreads, "fetch private archived threads", seen, threadIDs)
 	}
 
 	return threadIDs
+}
+
+type archivedThreadLister func(channelID snowflake.ID, before time.Time, limit int, opts ...rest.RequestOpt) (*discord.GetThreads, error)
+
+func (e *Engine) fetchArchivedThreads(channelID snowflake.ID, list archivedThreadLister, failure string, seen map[uint64]bool, ids []uint64) []uint64 {
+	var before time.Time
+	for {
+		page, err := list(channelID, before, archivedThreadPageSize)
+		if err != nil {
+			e.logger.Warn(failure, log.ID("channel_id", uint64(channelID)), zap.Error(err))
+			return ids
+		}
+		var more bool
+		if ids, before, more = collectArchivedPage(*page, seen, ids); !more {
+			return ids
+		}
+	}
+}
+
+// disgo sends the before cursor in whole seconds, so it steps a second past the last thread and seen drops repeats.
+func collectArchivedPage(page discord.GetThreads, seen map[uint64]bool, ids []uint64) ([]uint64, time.Time, bool) {
+	added := 0
+	for _, t := range page.Threads {
+		if id := uint64(t.ID()); !seen[id] {
+			seen[id] = true
+			ids = append(ids, id)
+			added++
+		}
+	}
+	// Nothing new means one second holds more threads than a page, and the cursor cannot move past it.
+	if !page.HasMore || added == 0 {
+		return ids, time.Time{}, false
+	}
+	return ids, page.Threads[len(page.Threads)-1].ThreadMetadata.ArchiveTimestamp.Add(time.Second), true
 }
 
 // purgeChannel fetches and deletes matching messages from a single channel or
@@ -1263,7 +1275,7 @@ func (e *Engine) purgeChannel(ctx context.Context, j *job.PurgeJob, state *execS
 	// Not at job start: a permission can be taken away between the gate and this channel's turn.
 	if missing := e.missingPermissionsForChannel(ctx, state, snowflake.ID(j.GuildID), cid); missing != 0 {
 		e.logger.Warn("channel skipped, missing permissions",
-			idField("channel_id", channelID),
+			log.ID("channel_id", channelID),
 			zap.String("missing_permissions", permissionNames(missing)),
 		)
 		return fmt.Errorf("%s", locale.MsgPurgeMissingPerms.In(j.Locale, permissionNames(missing)))
@@ -1282,28 +1294,32 @@ func (e *Engine) purgeChannel(ctx context.Context, j *job.PurgeJob, state *execS
 	pagesSinceFlush := 0
 
 	flush := func() error {
-		fresh, aged := splitAgedOut(buffered)
-		buffered = fresh
-
-		failed, err := e.deleteEach(ctx, state, ch, aged)
-		unresolved += failed
-		if err != nil {
-			return err
-		}
-
+		var aged []snowflake.ID
 		for len(buffered) > 0 {
 			if reason := abortReason(ctx); reason != nil {
 				e.commit(ctx, state, nil)
 				return reason
 			}
 
-			var batch []snowflake.ID
+			var batch, batchAged []snowflake.ID
 			batch, buffered = nextBatch(buffered)
+			// Split per batch, right before sending: every delete before it is time for a message to age out.
+			batch, batchAged = splitAgedOut(batch)
+			aged = append(aged, batchAged...)
+			if len(batch) == 0 {
+				continue
+			}
 			failed, err := e.deleteBatch(ctx, state, ch, batch)
 			if err != nil {
 				return err
 			}
 			unresolved += failed
+		}
+
+		failed, err := e.deleteEach(ctx, state, ch, aged)
+		unresolved += failed
+		if err != nil {
+			return err
 		}
 		e.commit(ctx, state, func() { ch.BeforeID = scannedTo })
 		pagesSinceFlush = 0
@@ -1328,15 +1344,17 @@ func (e *Engine) purgeChannel(ctx context.Context, j *job.PurgeJob, state *execS
 				e.commit(ctx, state, nil)
 				return reason
 			}
-			if fetchDeniedForChannel(err) {
+			if deniedForChannel(err) {
+				missing := permissionNames(deniedPermission(err))
 				e.logger.Warn("fetch denied",
-					idField("channel_id", channelID),
-					zap.String("missing_permissions", permissionNames(deniedPermission(err))),
+					log.ID("channel_id", channelID),
+					zap.String("missing_permissions", missing),
 					zap.Error(err),
 				)
-				return fmt.Errorf("%s", locale.MsgPurgeMissingPerms.In(j.Locale, permissionNames(deniedPermission(err))))
+				return fmt.Errorf("%s", locale.MsgPurgeMissingPerms.In(j.Locale, missing))
 			}
-			return fmt.Errorf("fetch messages from %d after %d: %w", channelID, scannedTo, err)
+			// No IDs: the completion card groups skipped channels by this exact text.
+			return fmt.Errorf("fetch messages: %w", err)
 		}
 		if len(messages) == 0 {
 			break
@@ -1399,7 +1417,7 @@ func (e *Engine) purgeChannel(ctx context.Context, j *job.PurgeJob, state *execS
 
 	if unresolved > 0 {
 		e.logger.Warn("channel finished with undeleted messages",
-			idField("channel_id", channelID),
+			log.ID("channel_id", channelID),
 			zap.Int("unresolved", unresolved),
 			zap.Int("deleted", ch.Deleted),
 		)
@@ -1646,30 +1664,28 @@ func cancelButton(j *job.PurgeJob) discord.ActionRowComponent {
 		discord.ButtonComponent{
 			Style:    discord.ButtonStyleDanger,
 			Label:    locale.MsgCancelButton.In(j.Locale),
-			CustomID: fmt.Sprintf("cancel:%s:%d", j.ID, j.RequestedByID),
+			CustomID: job.CancelButtonID(j.ID, j.RequestedByID),
 		},
 	}}
 }
 
-func (e *Engine) inProgressComponents(j *job.PurgeJob, target, status string, withCancel bool) []discord.LayoutComponent {
-	container := discord.NewContainer(
-		discord.NewTextDisplay(locale.MsgPurgeInProgress.In(j.Locale, target)),
-		discord.NewTextDisplay(locale.MsgPurgeStatusLabel.In(j.Locale, status)),
-	)
-	components := []discord.LayoutComponent{container}
-	if withCancel {
-		components = append(components, cancelButton(j))
+func (e *Engine) inProgressComponents(j *job.PurgeJob, target, status string) []discord.LayoutComponent {
+	return []discord.LayoutComponent{
+		discord.NewContainer(
+			discord.NewTextDisplay(locale.MsgPurgeInProgress.In(j.Locale, target)),
+			discord.NewTextDisplay(locale.MsgPurgeStatusLabel.In(j.Locale, status)),
+		),
+		cancelButton(j),
 	}
-	return components
 }
 
-func (e *Engine) sendInProgress(ctx context.Context, j *job.PurgeJob, state *execState, target, status string, withCancel bool) {
-	_ = e.updateComponents(ctx, j, state, e.inProgressComponents(j, target, status, withCancel)...)
+func (e *Engine) sendInProgress(ctx context.Context, j *job.PurgeJob, state *execState, target, status string) {
+	_ = e.updateComponents(ctx, j, state, e.inProgressComponents(j, target, status)...)
 }
 
-func (e *Engine) sendCancelled(ctx context.Context, j *job.PurgeJob, state *execState, totalDeleted int, showBranding bool) {
+func (e *Engine) sendCancelled(ctx context.Context, j *job.PurgeJob, state *execState, showBranding bool) {
 	msg := locale.MsgPurgeCancelledHeader.In(j.Locale)
-	if totalDeleted > 0 {
+	if totalDeleted := state.totalDeleted(); totalDeleted > 0 {
 		msg += locale.MsgPurgeCancelledCount.In(j.Locale, totalDeleted)
 	}
 	if err := e.deliverFinal(ctx, j, state, withBranding(showBranding, discord.NewContainer(discord.NewTextDisplay(msg)))...); err != nil {
@@ -1782,8 +1798,8 @@ func (e *Engine) discardStaleStatusMessage(state *execState) {
 	}
 	if err := e.client.Rest.DeleteMessage(state.staleChannelID, state.staleMessageID); err != nil {
 		e.logger.Warn("delete replaced status message",
-			idField("channel_id", uint64(state.staleChannelID)),
-			idField("message_id", uint64(state.staleMessageID)), zap.Error(err))
+			log.ID("channel_id", uint64(state.staleChannelID)),
+			log.ID("message_id", uint64(state.staleMessageID)), zap.Error(err))
 	}
 	state.staleChannelID, state.staleMessageID = 0, 0
 }
@@ -1820,8 +1836,8 @@ func (e *Engine) updateComponents(ctx context.Context, j *job.PurgeJob, state *e
 		}
 		target := []zap.Field{
 			zap.String("delivery", deliveryName(toDM)),
-			idField("channel_id", uint64(state.fallbackChannelID)),
-			idField("message_id", uint64(state.fallbackMessageID)),
+			log.ID("channel_id", uint64(state.fallbackChannelID)),
+			log.ID("message_id", uint64(state.fallbackMessageID)),
 		}
 		switch {
 		case statusMessageGone(err):
@@ -1861,8 +1877,8 @@ func (e *Engine) updateComponents(ctx context.Context, j *job.PurgeJob, state *e
 		)
 		target := []zap.Field{
 			zap.String("delivery", "interaction_webhook"),
-			idField("application_id", j.ApplicationID),
-			idField("command_message_id", uint64(state.commandMessageID)),
+			log.ID("application_id", j.ApplicationID),
+			log.ID("command_message_id", uint64(state.commandMessageID)),
 		}
 		switch {
 		case err == nil:
@@ -1882,26 +1898,31 @@ func (e *Engine) updateComponents(ctx context.Context, j *job.PurgeJob, state *e
 		}
 	}
 
-	if !state.channelDenied && j.InteractionChannelID != 0 {
-		channelID, messageID, err := e.createStatusMessage(snowflake.ID(j.InteractionChannelID), components...)
-		if err == nil {
-			e.discardStaleStatusMessage(state)
-			e.dismissStaleInteractionMessage(j, state, messageID)
-			e.setStatusTarget(ctx, state, channelID, messageID)
-			return nil
-		}
-		if statusChannelUnavailable(err) || state.spent(&state.channelAttempts) {
-			state.channelDenied = true
-		}
-		e.logger.Info("cannot create a channel status message",
-			idField("interaction_channel_id", j.InteractionChannelID),
-			zap.Bool("denied", state.channelDenied), zap.Error(err))
-	}
-
-	if e.openDMSurface(ctx, j, state, components...) {
+	if e.openChannelSurface(ctx, j, state, components...) || e.openDMSurface(ctx, j, state, components...) {
 		return nil
 	}
 	return errNoStatusSurface
+}
+
+// Reports whether a fresh status message was posted in the invoking channel.
+func (e *Engine) openChannelSurface(ctx context.Context, j *job.PurgeJob, state *execState, components ...discord.LayoutComponent) bool {
+	if state.channelDenied || j.InteractionChannelID == 0 {
+		return false
+	}
+	channelID, messageID, err := e.createStatusMessage(snowflake.ID(j.InteractionChannelID), components...)
+	if err == nil {
+		e.discardStaleStatusMessage(state)
+		e.dismissStaleInteractionMessage(j, state, messageID)
+		e.setStatusTarget(ctx, state, channelID, messageID)
+		return true
+	}
+	if statusChannelUnavailable(err) || state.spent(&state.channelAttempts) {
+		state.channelDenied = true
+	}
+	e.logger.Info("cannot create a channel status message",
+		log.ID("interaction_channel_id", j.InteractionChannelID),
+		zap.Bool("denied", state.channelDenied), zap.Error(err))
+	return false
 }
 
 func deliveryName(toDM bool) string {
@@ -1945,7 +1966,7 @@ func (e *Engine) openDMSurface(ctx context.Context, j *job.PurgeJob, state *exec
 					state.dmDenied = true
 				}
 				e.logger.Warn("opening requester DM throttled",
-					idField("requested_by_id", j.RequestedByID),
+					log.ID("requested_by_id", j.RequestedByID),
 					zap.Bool("denied", state.dmDenied), zap.Error(err))
 				return false
 			}
@@ -1953,7 +1974,7 @@ func (e *Engine) openDMSurface(ctx context.Context, j *job.PurgeJob, state *exec
 				state.dmDenied = true
 			}
 			e.logger.Warn("open requester DM",
-				idField("requested_by_id", j.RequestedByID),
+				log.ID("requested_by_id", j.RequestedByID),
 				zap.Bool("denied", state.dmDenied), zap.Error(err))
 			return false
 		}
@@ -1966,8 +1987,8 @@ func (e *Engine) openDMSurface(ctx context.Context, j *job.PurgeJob, state *exec
 			state.dmDenied = true
 		}
 		e.logger.Warn("direct message status surface refused",
-			idField("requested_by_id", j.RequestedByID),
-			idField("dm_channel_id", uint64(state.dmChannelID)),
+			log.ID("requested_by_id", j.RequestedByID),
+			log.ID("dm_channel_id", uint64(state.dmChannelID)),
 			zap.Error(err),
 		)
 		return false
@@ -1975,27 +1996,24 @@ func (e *Engine) openDMSurface(ctx context.Context, j *job.PurgeJob, state *exec
 	e.setStatusTarget(ctx, state, channelID, messageID)
 	e.discardStaleStatusMessage(state)
 	e.logger.Info("direct message status surface opened",
-		idField("requested_by_id", j.RequestedByID),
-		idField("dm_channel_id", uint64(channelID)),
+		log.ID("requested_by_id", j.RequestedByID),
+		log.ID("dm_channel_id", uint64(channelID)),
 	)
 	return true
 }
 
 // Reports whether a fresh status message was posted, so Execute can skip the opening edit.
 func (e *Engine) openStatusSurface(ctx context.Context, j *job.PurgeJob, state *execState, target string) bool {
-	startComponents := e.inProgressComponents(j, target, locale.MsgPurgeStatusStarting.In(j.Locale), true)
+	startComponents := e.inProgressComponents(j, target, locale.MsgPurgeStatusStarting.In(j.Locale))
 
 	switch {
-	case state.tokenDead || interactionTokenSpent(j.CreatedAt, time.Now()):
+	case webhookRungClosed(j, state):
 		// A recovered job's token is dead by arithmetic, and progress already has the ID.
 		state.tokenDead = true
 	default:
 		msg, err := e.client.Rest.GetInteractionResponse(snowflake.ID(j.ApplicationID), j.InteractionToken)
 		if err == nil {
-			if msg.ID != 0 && !msg.Flags.Has(discord.MessageFlagEphemeral) {
-				state.commandMessageID = msg.ID
-				state.exclude(msg.ID)
-			}
+			state.adoptCommandMessage(msg)
 			// Adoptable: the webhook rung clears the spinner and updateComponents adopts it.
 			if _, _, ok := statusTargetFromInteractionResponse(msg); ok {
 				return false
@@ -2005,29 +2023,18 @@ func (e *Engine) openStatusSurface(ctx context.Context, j *job.PurgeJob, state *
 		// Falling through would post a second status message a tick before the webhook works.
 		if webhookNotPropagated(err) {
 			e.logger.Info("interaction webhook not yet propagated, leaving the surface to the ticker",
-				idField("application_id", j.ApplicationID), zap.Error(err))
+				log.ID("application_id", j.ApplicationID), zap.Error(err))
 			return false
 		}
 		if tokenExpiredError(err) {
 			state.tokenDead = true
 		}
 		e.logger.Info("interaction response unavailable",
-			idField("application_id", j.ApplicationID), zap.Error(err))
+			log.ID("application_id", j.ApplicationID), zap.Error(err))
 	}
 
-	if !state.channelDenied && j.InteractionChannelID != 0 {
-		channelID, messageID, err := e.createStatusMessage(snowflake.ID(j.InteractionChannelID), startComponents...)
-		if err == nil {
-			e.dismissStaleInteractionMessage(j, state, messageID)
-			e.setStatusTarget(ctx, state, channelID, messageID)
-			return true
-		}
-		if statusChannelUnavailable(err) || state.spent(&state.channelAttempts) {
-			state.channelDenied = true
-		}
-		e.logger.Info("cannot create a channel status message",
-			idField("interaction_channel_id", j.InteractionChannelID),
-			zap.Bool("denied", state.channelDenied), zap.Error(err))
+	if e.openChannelSurface(ctx, j, state, startComponents...) {
+		return true
 	}
 
 	// With the token gone too, nothing in the guild can report this run.
@@ -2040,7 +2047,7 @@ func (e *Engine) openStatusSurface(ctx context.Context, j *job.PurgeJob, state *
 // Opens the DM first and only then rewrites the channel message, so the signpost is never a
 // promise of a DM that did not arrive.
 func (e *Engine) handOverBeforeTokenExpiry(ctx context.Context, j *job.PurgeJob, state *execState, target, status string) {
-	opened := e.openDMSurface(ctx, j, state, e.inProgressComponents(j, target, status, true)...)
+	opened := e.openDMSurface(ctx, j, state, e.inProgressComponents(j, target, status)...)
 	// Not yet refused, so do not publish an unreachable notice the dead token could never
 	// correct; the next tick retries while the token still lives.
 	if !opened && !state.dmDenied && j.RequestedByID != 0 {
@@ -2060,5 +2067,5 @@ func (e *Engine) handOverBeforeTokenExpiry(ctx context.Context, j *job.PurgeJob,
 	}
 	state.tokenDead = true
 	e.logger.Info("handing status surface to direct message before token expiry",
-		zap.Bool("dm_opened", opened), idField("requested_by_id", j.RequestedByID))
+		zap.Bool("dm_opened", opened), log.ID("requested_by_id", j.RequestedByID))
 }

@@ -1,9 +1,9 @@
-github.com/PurgeBot-net/common v0.0.0-20261121002828-208336f6a77e h1:ETubHeCEr1VzcavvpL0/HeJfJlJVIfUcHGbI83J+4s8=
-github.com/PurgeBot-net/common v0.0.0-20261121002828-208336f6a77e/go.mod h1:YIp22B4GlcR/0Uv6e8ZNJr+h6M3p4SeYXXmSH7ncECM=
-github.com/PurgeBot-net/database v0.0.0-20261121002816-bb0cfc314e04 h1:djsIiow1PQ5c0x5Q59oxG7Dh5oMqCPVD0O542vh9xRQ=
-github.com/PurgeBot-net/database v0.0.0-20261121002816-bb0cfc314e04/go.mod h1:84Z7ZOYq3XE+mbywNrbgkDCcsoSrKbLECt1LQgX0VMA=
-github.com/PurgeBot-net/locale v0.0.0-20261121002805-55ed6cdfe883 h1:rgMxdvW53aqOYld3phYCprp35gaIvuDLxMjbEX1FF5Q=
-github.com/PurgeBot-net/locale v0.0.0-20261121002805-55ed6cdfe883/go.mod h1:xB0pOX3nhABDEmjLb4EibkS+c3yQFlP2IQuYHlB7d0I=
+github.com/PurgeBot-net/common v0.0.0-20261122154903-567f0e604a02 h1:Cf9lWW36pWm+CxvAG3IbYw2WhSyQwY8l0MUrCtE39eY=
+github.com/PurgeBot-net/common v0.0.0-20261122154903-567f0e604a02/go.mod h1:YIp22B4GlcR/0Uv6e8ZNJr+h6M3p4SeYXXmSH7ncECM=
+github.com/PurgeBot-net/database v0.0.0-20261122154845-11f004ac8fb1 h1:Oo8vuYz5Epg1LvbNiRdzfDcS2uquQ5kxjGWmRARjNRQ=
+github.com/PurgeBot-net/database v0.0.0-20261122154845-11f004ac8fb1/go.mod h1:84Z7ZOYq3XE+mbywNrbgkDCcsoSrKbLECt1LQgX0VMA=
+github.com/PurgeBot-net/locale v0.0.0-20261122154828-a450af900b6e h1:LH++zdePiKCe6/pidC3N1IWe0xO+BXWAAXzBWU2sBqA=
+github.com/PurgeBot-net/locale v0.0.0-20261122154828-a450af900b6e/go.mod h1:xB0pOX3nhABDEmjLb4EibkS+c3yQFlP2IQuYHlB7d0I=
 github.com/bsm/ginkgo/v2 v2.12.0 h1:Ny8MWAHyOepLGlLKYmXG4IEkioBysk6GpaRTLC8zwWs=
 github.com/bsm/ginkgo/v2 v2.12.0/go.mod h1:SwYbGRRDovPVboqFv0tPTcG1sN61LM1Z4ARdbAV9g4c=
 github.com/bsm/gomega v1.27.10 h1:yeMWxP2pV2fG3FgAODIY8EiRE3dy0aeFYt4l7wh6yKA=

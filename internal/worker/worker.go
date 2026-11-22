@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -31,6 +30,9 @@ type Worker struct {
 	redis   *redis.Client
 	client  *bot.Client
 	running atomic.Int64
+
+	// Process-local is enough: there is only one purger.
+	executing sync.Map
 }
 
 func New(cfg config.Config, logger *zap.Logger, db *database.Database, redis *redis.Client) (*Worker, error) {
@@ -45,11 +47,6 @@ func New(cfg config.Config, logger *zap.Logger, db *database.Database, redis *re
 		return nil, fmt.Errorf("create discord client: %w", err)
 	}
 	return &Worker{cfg: cfg, logger: logger, db: db, redis: redis, client: client}, nil
-}
-
-// Snowflakes exceed 2^53, so a JSON reader using float64 corrupts them as numbers.
-func idField(key string, id uint64) zap.Field {
-	return zap.String(key, strconv.FormatUint(id, 10))
 }
 
 // Run blocks, spawning WorkerConcurrency goroutines that consume purge jobs
@@ -86,24 +83,39 @@ func (w *Worker) loop(ctx context.Context) {
 				return
 			}
 			w.logger.Error("dequeue job", zap.Error(err))
+			// go-redis fails fast while Redis is down, so without a pause each goroutine spins and floods Sentry.
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(time.Second):
+			}
 			continue
 		}
 		if j == nil {
 			continue // timeout, loop again
 		}
-		jobLog := w.logger.With(zap.String("job_id", j.ID), idField("guild_id", j.GuildID))
+		jobLog := w.logger.With(zap.String("job_id", j.ID), log.ID("guild_id", j.GuildID))
+
+		// Claimed before the guard and released after cleanup, so a duplicate entry sees the claim or the deleted key.
+		if _, dup := w.executing.LoadOrStore(j.ID, struct{}{}); dup {
+			jobLog.Info("skipping stale recovered job", zap.String("reason", "already running"))
+			continue
+		}
 
 		// Guard against double-enqueue: skip if this is a stale copy of a recovered job.
 		active, err := job.GetActiveJob(ctx, w.redis, j.GuildID)
 		if err != nil {
+			w.executing.Delete(j.ID)
 			jobLog.Error("verify active job, dropping until restart recovery", zap.Error(err))
 			continue
 		}
 		if active == nil {
+			w.executing.Delete(j.ID)
 			jobLog.Info("skipping stale recovered job", zap.String("reason", "guild has no active job"))
 			continue
 		}
 		if active.ID != j.ID {
+			w.executing.Delete(j.ID)
 			jobLog.Info("skipping stale recovered job",
 				zap.String("reason", "superseded"),
 				zap.String("active_job_id", active.ID),
@@ -115,8 +127,8 @@ func (w *Worker) loop(ctx context.Context) {
 		jobLog.Info("processing purge job",
 			zap.String("purge_type", string(j.PurgeType)),
 			zap.String("target_type", string(j.TargetType)),
-			idField("target_id", j.TargetID),
-			idField("requested_by_id", j.RequestedByID),
+			log.ID("target_id", j.TargetID),
+			log.ID("requested_by_id", j.RequestedByID),
 			zap.Duration("queue_wait", time.Since(j.CreatedAt)),
 			zap.Int64("running", running),
 		)
@@ -141,8 +153,8 @@ func (w *Worker) loop(ctx context.Context) {
 				jobLog.Error("purge job failed", zap.Int64("running", running), zap.Error(err))
 			}
 		}
-		job.DeleteProgress(cleanupCtx, w.redis, j.ID)
-		job.DeleteActiveJob(cleanupCtx, w.redis, j.GuildID)
+		job.DeleteActiveJob(cleanupCtx, w.redis, *j)
+		w.executing.Delete(j.ID)
 		cancel()
 	}
 }
@@ -151,16 +163,16 @@ func (w *Worker) loop(ctx context.Context) {
 func (w *Worker) recoverActiveJobs(ctx context.Context) {
 	jobs, err := job.GetAllActiveJobs(ctx, w.redis)
 	if err != nil {
+		// The jobs that did decode come back alongside, so they are still recovered.
 		w.logger.Error("scan active jobs for recovery", zap.Error(err))
-		return
 	}
 	w.logger.Info("scanned active jobs for recovery", zap.Int("jobs", len(jobs)))
 	for _, j := range jobs {
-		jobLog := w.logger.With(zap.String("job_id", j.ID), idField("guild_id", j.GuildID))
-		if err := job.RemoveQueued(ctx, w.redis, j); err != nil {
+		jobLog := w.logger.With(zap.String("job_id", j.ID), log.ID("guild_id", j.GuildID))
+		if err := job.RemoveQueued(ctx, w.redis, &j); err != nil {
 			jobLog.Warn("remove stale queued recovered job, duplicate queue entry expected", zap.Error(err))
 		}
-		if err := job.Enqueue(ctx, w.redis, j); err != nil {
+		if err := job.Enqueue(ctx, w.redis, &j); err != nil {
 			jobLog.Error("re-enqueue recovered job", zap.Error(err))
 		} else {
 			jobLog.Info("recovered active job",

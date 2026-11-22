@@ -3,9 +3,9 @@ module github.com/PurgeBot-net/purger
 go 1.26.0
 
 require (
-	github.com/PurgeBot-net/common v0.0.0-20261121002828-208336f6a77e
-	github.com/PurgeBot-net/database v0.0.0-20261121002816-bb0cfc314e04
-	github.com/PurgeBot-net/locale v0.0.0-20261121002805-55ed6cdfe883
+	github.com/PurgeBot-net/common v0.0.0-20261122154903-567f0e604a02
+	github.com/PurgeBot-net/database v0.0.0-20261122154845-11f004ac8fb1
+	github.com/PurgeBot-net/locale v0.0.0-20261122154828-a450af900b6e
 	github.com/caarlos0/env/v11 v11.4.1
 	github.com/disgoorg/disgo v0.20.0
 	github.com/disgoorg/snowflake/v2 v2.0.3
